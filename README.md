@@ -127,10 +127,14 @@ acknowledgement.
 
 ### Credentials
 
-Importing an MCP server from a client config replaces env and header values
-with `${VAR}` placeholders, so secrets never enter the store. When deploying,
-placeholders match whatever value the client already holds, and a merge into
-`claude_desktop_config.json` keeps the credentials already there.
+Importing an MCP server from a client config replaces credentials with
+`${VAR}` placeholders, so secrets never enter the store. That covers env and
+header values, arguments after flags like `--token` or `--api-key`, values
+that look like keys (`sk-…`, `ghp_…`, and so on), secret query parameters, and
+token-like URL path segments. When deploying, a placeholder matches whatever
+value the client already holds, and a merge into `claude_desktop_config.json`
+keeps the credentials already there. A change you make to a literal value
+(say, `LOG_LEVEL`) makes the entry a conflict, and agentctl won't revert it.
 
 ## Commands
 
@@ -169,6 +173,10 @@ agentctl import https://github.com/org/repo#skills/pdf --version v1.2.0
 agentctl import ./.mcp.json --all                      # every MCP server in a file
 ```
 
+Import skips symlinks that point outside the asset and warns about them, and
+packages never include content from outside the asset. A directory of
+executables without a `tool.json` imports as a script tool.
+
 Each import records the source, the version or git revision, the license
 (from frontmatter, `plugin.json`, or a LICENSE file), and content hashes.
 `--on-conflict fail|skip|rename` controls name collisions. The default, `fail`,
@@ -195,6 +203,20 @@ repository, or the target it was imported from (plugin caches included).
 three-way merge. Upstream changes to files you haven't touched are applied, your
 local additions and edits are kept, and if you and upstream changed the same
 file, it stops before changing anything.
+
+### Ownership
+
+agentctl only replaces or removes what its records show it deployed, and only
+while that is unchanged. These count as conflicts:
+
+- a destination another asset occupies
+- a symlink you pointed somewhere else
+- a deployed copy you edited
+- an unreadable directory
+- a directory holding `.git`
+
+An explicit `--method copy` is remembered on later deploys.
+`update --apply` edits the store in place, so a `.git` inside an asset survives.
 
 ## Configuration
 

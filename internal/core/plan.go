@@ -90,6 +90,12 @@ func (a *App) Plan(target, project string, as *Asset, method string) []*Unit {
 		if m := a.Config.Deploy.Method; m != "" && m != "auto" && contains(sup.Methods, m) {
 			method = m
 		}
+		// Otherwise keep the method of an earlier explicit link or copy.
+		for _, d := range a.State.ForAsset(as.Ref.String(), target, project) {
+			if method == "" && (d.Method == MethodCopy || d.Method == MethodLink) && contains(sup.Methods, d.Method) {
+				method = d.Method
+			}
+		}
 		if method == "" {
 			method = sup.Methods[0]
 			if method == MethodLink && a.GOOS == "windows" {
@@ -344,11 +350,22 @@ func (a *App) Evaluate(u *Unit) *Eval {
 	return e
 }
 
-func (a *App) owned(u *Unit) *Deployment {
-	if ds := a.State.ForDest(u.Dest, u.Key); len(ds) > 0 {
-		return ds[0]
+// owner splits the records for u's destination into this asset's own
+// (mine) and the first other asset occupying it. Instruction assets on the
+// same target share one file, so they count as the same owner.
+func (a *App) owner(u *Unit) (mine *Deployment, other string) {
+	refs := append([]string{u.Asset}, u.group...)
+	for _, d := range a.State.ForDest(u.Dest, u.Key) {
+		ours := contains(refs, d.Asset) ||
+			(strings.HasPrefix(d.Asset, string(Instructions)+"/") && strings.HasPrefix(u.Asset, string(Instructions)+"/") && d.Target == u.Target && d.Project == u.Project)
+		switch {
+		case ours && (mine == nil || d.Target == u.Target):
+			mine = d
+		case !ours && other == "":
+			other = d.Asset
+		}
 	}
-	return nil
+	return mine, other
 }
 
 func kindOfPath(p string) string {
@@ -358,6 +375,33 @@ func kindOfPath(p string) string {
 	return "file"
 }
 
+// evalExisting classifies a real (non-symlink) file or directory at the
+// destination. It never treats unreadable or .git-holding trees as ours.
+func (a *App) evalExisting(e *Eval, mine *Deployment, sameIsOK bool, replaceNote string) {
+	u := e.Unit
+	if fsx.ContainsGit(u.Dest) {
+		e.State, e.Detail = StateConflict, a.Abbrev(u.Dest)+" contains a .git directory"
+		return
+	}
+	h, err := fsx.Hash(u.Dest)
+	if err != nil {
+		e.State, e.Detail = StateConflict, "cannot read "+a.Abbrev(u.Dest)+": "+err.Error()
+		return
+	}
+	switch {
+	case sameIsOK && h == u.Want && mine != nil:
+		e.State, e.Detail = StateOK, "up to date"
+	case h == u.Want && mine == nil:
+		e.State, e.Detail, e.adoptable = StateConflict, "unmanaged "+kindOfPath(u.Dest)+" identical to the store (deploy --adopt takes it over)", true
+	case mine != nil && mine.DestHash != "" && mine.DestHash == h:
+		e.State, e.Detail = StateOutdated, replaceNote
+	case mine != nil:
+		e.State, e.Detail = StateConflict, "modified after deployment"
+	default:
+		e.State, e.Detail = StateConflict, "unmanaged "+kindOfPath(u.Dest)+" exists"
+	}
+}
+
 func (a *App) evalLink(e *Eval) {
 	u := e.Unit
 	fi, err := os.Lstat(u.Dest)
@@ -365,30 +409,28 @@ func (a *App) evalLink(e *Eval) {
 		e.State, e.Detail = StateMissing, "not deployed"
 		return
 	}
-	rec := a.owned(u)
+	mine, other := a.owner(u)
 	if fi.Mode()&os.ModeSymlink != 0 {
 		target, _ := fsx.LinkTarget(u.Dest)
-		if fsx.SamePath(target, u.Source) {
+		switch {
+		case fsx.SamePath(target, u.Source):
 			e.State, e.Detail = StateOK, "linked"
-			return
-		}
-		if rec != nil || fsx.Within(a.Store.Root, target) {
+		case other != "":
+			e.State, e.Detail = StateConflict, "occupied by "+other
+		case fsx.Within(a.Store.Root, target):
 			e.State, e.Detail = StateOutdated, "links to "+a.Abbrev(target)
-			return
+		default:
+			e.State, e.Detail = StateConflict, "symlink to "+a.Abbrev(target)+" not made by agentctl"
 		}
-		e.State, e.Detail = StateConflict, "unmanaged symlink to "+a.Abbrev(target)
 		return
 	}
-	h, _ := fsx.Hash(u.Dest)
-	switch {
-	case rec != nil && rec.DestHash == h:
-		e.State, e.Detail = StateOutdated, "managed copy; will become a link"
-	case rec != nil:
-		e.State, e.Detail = StateConflict, "managed copy was modified after deployment"
-	case h == u.Want:
-		e.State, e.Detail, e.adoptable = StateConflict, "unmanaged "+kindOfPath(u.Dest)+" identical to the store (deploy --adopt replaces it)", true
-	default:
-		e.State, e.Detail = StateConflict, "unmanaged "+kindOfPath(u.Dest)+" exists"
+	if other != "" {
+		e.State, e.Detail = StateConflict, "occupied by "+other
+		return
+	}
+	a.evalExisting(e, mine, false, "managed copy; will become a link")
+	if e.State == StateConflict && e.adoptable {
+		e.Detail = "unmanaged " + kindOfPath(u.Dest) + " identical to the store (deploy --adopt replaces it)"
 	}
 }
 
@@ -399,29 +441,21 @@ func (a *App) evalCopy(e *Eval) {
 		e.State, e.Detail = StateMissing, "not deployed"
 		return
 	}
-	rec := a.owned(u)
+	mine, other := a.owner(u)
+	if other != "" {
+		e.State, e.Detail = StateConflict, "occupied by "+other
+		return
+	}
 	if fi.Mode()&os.ModeSymlink != 0 {
 		target, _ := fsx.LinkTarget(u.Dest)
-		if rec != nil || fsx.Within(a.Store.Root, target) {
+		if fsx.Within(a.Store.Root, target) {
 			e.State, e.Detail = StateOutdated, "linked; will become a copy"
 			return
 		}
-		e.State, e.Detail = StateConflict, "unmanaged symlink to "+a.Abbrev(target)
+		e.State, e.Detail = StateConflict, "symlink to "+a.Abbrev(target)+" not made by agentctl"
 		return
 	}
-	h, _ := fsx.Hash(u.Dest)
-	switch {
-	case h == u.Want && rec != nil:
-		e.State, e.Detail = StateOK, "up to date"
-	case h == u.Want:
-		e.State, e.Detail, e.adoptable = StateConflict, "unmanaged "+kindOfPath(u.Dest)+" identical to the store (deploy --adopt takes it over)", true
-	case rec != nil && rec.DestHash == h:
-		e.State, e.Detail = StateOutdated, "store changed since deployment"
-	case rec != nil:
-		e.State, e.Detail = StateConflict, "modified after deployment"
-	default:
-		e.State, e.Detail = StateConflict, "unmanaged "+kindOfPath(u.Dest)+" exists"
-	}
+	a.evalExisting(e, mine, true, "store changed since deployment")
 }
 
 func (a *App) evalAcknowledged(e *Eval) {
@@ -459,8 +493,8 @@ func (a *App) evalVerified(e *Eval) {
 		e.State, e.Detail = StateBlocked, err.Error()
 	case found && match:
 		e.State, e.Detail = StateOK, "verified in "+a.Abbrev(u.Dest)
-	case found && rec != nil && rec.DestHash != "" && rec.DestHash == ownershipHash(have):
-		e.State, e.Detail = StateOutdated, "configured from an older revision"
+	case found && rec != nil && rec.Value != nil && mcpMatch(rec.Value, have):
+		e.State, e.Detail = StateOutdated, "configured from an older revision; run the printed commands"
 	case found:
 		e.State, e.Detail = StateConflict, "configured differently in "+a.Abbrev(u.Dest)
 	default:
@@ -482,6 +516,7 @@ func (a *App) Apply(e *Eval, adopt bool) error {
 	u := e.Unit
 	switch e.State {
 	case StateOK:
+		a.recordOK(e)
 		return nil
 	case StateBlocked:
 		return fmt.Errorf("blocked: %s", e.Detail)
@@ -539,11 +574,16 @@ func (a *App) Apply(e *Eval, adopt bool) error {
 		if err != nil {
 			return err
 		}
-		rec.DestHash = ownershipHash(written)
+		rec.DestHash = canonicalHash(written)
+		rec.Value = u.value
 	case MethodManual:
 		rec.Manual = true
-		if u.verify != nil {
-			rec.DestHash = ownershipHash(u.value)
+		rec.Value = u.value
+		if old := a.State.Find(u.Target, u.Project, u.Asset, u.Dest, u.Key); e.State == StateOutdated && old != nil {
+			// The client still holds the old entry; keep recognizing it
+			// until the user replaces it.
+			rec.Value = old.Value
+			u.Steps = append(append([]string{}, u.removeSteps...), u.Steps...)
 		}
 	}
 	for _, ref := range append([]string{u.Asset}, u.group...) {
@@ -552,6 +592,28 @@ func (a *App) Apply(e *Eval, adopt bool) error {
 		a.State.Upsert(&r)
 	}
 	return nil
+}
+
+// recordOK records ownership of a destination that is already correct but
+// has no record for this target, such as a script link shared by targets.
+func (a *App) recordOK(e *Eval) {
+	u := e.Unit
+	switch u.Method {
+	case MethodLink, MethodCopy, MethodGenerate, MethodConfig:
+	default:
+		return
+	}
+	if a.State.Find(u.Target, u.Project, u.Asset, u.Dest, u.Key) != nil {
+		return
+	}
+	rec := &Deployment{Target: u.Target, Project: u.Project, Asset: u.Asset, Method: u.Method, Dest: u.Dest, Key: u.Key, SourceHash: u.Want, At: a.Now().UTC()}
+	switch u.Method {
+	case MethodCopy, MethodGenerate:
+		rec.DestHash, _ = fsx.Hash(u.Dest)
+	case MethodConfig:
+		rec.Value = u.value
+	}
+	a.State.Upsert(rec)
 }
 
 // clearDest removes a managed destination before replacing it. When
@@ -568,4 +630,16 @@ func (a *App) clearDest(dest string, adopt bool) error {
 		return os.Remove(dest)
 	}
 	return os.RemoveAll(dest)
+}
+
+// managedBy returns the asset agentctl deployed at p, if any.
+func (a *App) managedBy(p string) string {
+	if ds := a.State.ForDest(p, ""); len(ds) > 0 {
+		return ds[0].Asset
+	}
+	if fsx.IsSymlink(p) && linksIntoStore(a, p) {
+		t, _ := fsx.LinkTarget(p)
+		return storeRefFor(a, t)
+	}
+	return ""
 }

@@ -68,7 +68,11 @@ type candidate struct {
 func (c *candidate) materialize(dst string) error {
 	switch {
 	case c.Dir != "":
-		return fsx.CopyTree(c.Dir, dst)
+		skipped, err := fsx.CopyTreeContained(c.Dir, dst)
+		if len(skipped) > 0 {
+			c.Warnings = append(c.Warnings, "skipped symlinks that point outside the asset: "+strings.Join(skipped, ", "))
+		}
+		return err
 	case c.Kind == Instructions && c.File != "":
 		return fsx.CopyFile(c.File, filepath.Join(dst, "AGENTS.md"), 0o644)
 	case c.Kind == Tools && c.File != "":
@@ -329,6 +333,9 @@ func (a *App) resolveImport(source string, o ImportOptions) ([]*candidate, func(
 	if fsx.Within(a.Store.Root, path) {
 		return nil, noop, fmt.Errorf("%s is already inside the store", a.Abbrev(path))
 	}
+	if ref := a.managedBy(path); ref != "" {
+		return nil, noop, fmt.Errorf("%s was deployed by agentctl from %s; it is not a source", a.Abbrev(path), ref)
+	}
 	cands, err := locate(path, "", o.Kind)
 	for _, c := range cands {
 		c.Source = Source{Type: "path", Location: firstNonEmpty(c.Dir, c.File, c.Source.Location), Key: c.Source.Key, Kind: string(c.Kind), Name: c.Name}
@@ -377,9 +384,9 @@ func (a *App) itemCandidate(it *Item) (*candidate, error) {
 		if m == nil {
 			return nil, fmt.Errorf("%s: unreadable MCP entry", it.ID)
 		}
-		c.Tool = &ToolSpec{Description: it.Description, MCP: m}
+		c.Tool = &ToolSpec{Description: describeServer(m), MCP: m}
 		if len(withheld) > 0 {
-			c.Warnings = append(c.Warnings, "credential values for "+strings.Join(withheld, ", ")+" were replaced with ${VAR} placeholders; they stay in "+it.Target+"'s config")
+			c.Warnings = append(c.Warnings, "credential values ("+strings.Join(withheld, ", ")+") were replaced with ${VAR} placeholders; they stay in "+it.Target+"'s config")
 		}
 	case it.Kind == Instructions:
 		c.File = it.Path
@@ -426,9 +433,12 @@ func locate(root, rootName string, kind Kind) ([]*candidate, error) {
 				for _, n := range sortedKeys(servers) {
 					raw, _ := json.Marshal(servers[n])
 					spec, withheld := mcpFromClient(raw)
-					c := &candidate{Kind: Tools, Name: SanitizeName(n), Tool: &ToolSpec{Description: describeMCP(raw), MCP: spec}, Source: Source{Key: "mcpServers." + n, Location: root}}
+					if spec == nil {
+						continue
+					}
+					c := &candidate{Kind: Tools, Name: SanitizeName(n), Tool: &ToolSpec{Description: describeServer(spec), MCP: spec}, Source: Source{Key: "mcpServers." + n, Location: root}}
 					if len(withheld) > 0 {
-						c.Warnings = append(c.Warnings, "credential values for "+strings.Join(withheld, ", ")+" were replaced with ${VAR} placeholders")
+						c.Warnings = append(c.Warnings, "credential values ("+strings.Join(withheld, ", ")+") were replaced with ${VAR} placeholders")
 					}
 					keep(c)
 				}
@@ -473,6 +483,9 @@ func locate(root, rootName string, kind Kind) ([]*candidate, error) {
 	})
 	if err != nil {
 		return nil, err
+	}
+	if len(out) == 0 && len(findExecutables(root)) > 0 {
+		keep(&candidate{Kind: Tools, Name: SanitizeName(rootName), Dir: root})
 	}
 	if len(out) == 0 {
 		for _, f := range []string{"AGENTS.md", "CLAUDE.md"} {

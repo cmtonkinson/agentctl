@@ -368,6 +368,9 @@ func ZipTree(src, dst, prefix string) error {
 		abs := e.Abs
 		mode := e.Mode
 		if e.Link != "" {
+			if LinkEscapes(src, e) {
+				continue // never package content from outside the asset
+			}
 			fi, err := os.Stat(abs)
 			if err != nil || fi.IsDir() {
 				continue // dangling or directory links are not packaged
@@ -490,4 +493,83 @@ func FileHashes(root string) (map[string]string, error) {
 		out[e.Rel] = h
 	}
 	return out, nil
+}
+
+// LinkEscapes reports whether a symlink entry under root points outside
+// root (absolute targets included).
+func LinkEscapes(root string, e Entry) bool {
+	if e.Link == "" {
+		return false
+	}
+	if filepath.IsAbs(e.Link) {
+		return true
+	}
+	realRoot := Real(root)
+	target := filepath.Join(filepath.Dir(e.Abs), e.Link)
+	if !Within(realRoot, target) {
+		return true
+	}
+	if r, err := filepath.EvalSymlinks(target); err == nil && !Within(realRoot, r) {
+		return true
+	}
+	return false
+}
+
+// CopyTreeContained copies src to dst like CopyTree but skips symlinks
+// that point outside src, returning their relative paths.
+func CopyTreeContained(src, dst string) ([]string, error) {
+	if !IsDir(src) {
+		return nil, CopyTree(src, dst)
+	}
+	if Exists(dst) {
+		return nil, fmt.Errorf("%s already exists", dst)
+	}
+	entries, err := Walk(src)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return nil, err
+	}
+	var skipped []string
+	for _, e := range entries {
+		target := filepath.Join(dst, filepath.FromSlash(e.Rel))
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return skipped, err
+		}
+		if e.Link != "" {
+			if LinkEscapes(src, e) {
+				skipped = append(skipped, e.Rel)
+				continue
+			}
+			if err := os.Symlink(e.Link, target); err != nil {
+				return skipped, err
+			}
+			continue
+		}
+		if err := CopyFile(e.Abs, target, e.Mode); err != nil {
+			return skipped, err
+		}
+	}
+	return skipped, nil
+}
+
+// ContainsGit reports whether a tree holds a .git entry, which hashing
+// ignores but which must never be deleted as if it were disposable.
+func ContainsGit(root string) bool {
+	if !IsDir(root) || IsSymlink(root) {
+		return false
+	}
+	found := false
+	filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || found {
+			return filepath.SkipDir
+		}
+		if d.Name() == ".git" {
+			found = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
 }

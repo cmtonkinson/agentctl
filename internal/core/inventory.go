@@ -310,16 +310,11 @@ func (c *collector) mcpMap(target, project, file, top string, servers map[string
 }
 
 func describeMCP(raw json.RawMessage) string {
-	var v map[string]any
-	json.Unmarshal(raw, &v)
-	if u := str(v["url"]); u != "" {
-		return "MCP server at " + u
+	m, _ := mcpFromClient(raw)
+	if m == nil {
+		return "MCP server"
 	}
-	cmd := str(v["command"])
-	if args := asStrings(v["args"]); len(args) > 0 {
-		cmd += " " + strings.Join(args, " ")
-	}
-	return "MCP server: " + truncate(cmd, 60)
+	return describeServer(m)
 }
 
 func (c *collector) claudeCode(projects []string) {

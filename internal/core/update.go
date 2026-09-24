@@ -1,6 +1,7 @@
 package core
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -63,6 +64,9 @@ func (a *App) fetchSource(src *Source, kind Kind, version string) (*candidate, f
 		if !fsx.Exists(src.Location) {
 			return nil, noop, fmt.Errorf("%s no longer exists", a.Abbrev(src.Location))
 		}
+		if ref := a.managedBy(src.Location); ref != "" {
+			return nil, noop, &managedSourceError{a.Abbrev(src.Location), ref}
+		}
 		cands, err := locate(src.Location, src.Name, kind)
 		if err != nil {
 			return nil, noop, err
@@ -120,9 +124,22 @@ func (a *App) fetchSource(src *Source, kind Kind, version string) (*candidate, f
 				return c, noop, err
 			}
 		}
+		for _, it := range inv.Items {
+			if it.Name == src.Name && it.Path == src.Location && it.Status == ItemManaged {
+				return nil, noop, &managedSourceError{a.Abbrev(it.Path), it.StoreRef}
+			}
+		}
 		return nil, noop, fmt.Errorf("%s no longer has %s %s", src.Target, kind, src.Name)
 	}
 	return nil, noop, fmt.Errorf("unknown source type %q", src.Type)
+}
+
+// managedSourceError reports an upstream path that is now one of
+// agentctl's own deployments, so reading it would feed the store to itself.
+type managedSourceError struct{ path, ref string }
+
+func (e *managedSourceError) Error() string {
+	return e.path + " is now deployed by agentctl from " + e.ref + "; the store is its source"
 }
 
 func describeSource(a *App, s *Source) string {
@@ -216,6 +233,11 @@ func (a *App) Update(o UpdateOptions) ([]*UpdateResult, error) {
 		c, cleanup, err := a.fetchSource(src, as.Kind, o.Version)
 		p := &pending{as: as, res: res, cleanup: []func(){cleanup}}
 		todo = append(todo, p)
+		var managed *managedSourceError
+		if errors.As(err, &managed) {
+			res.State, res.Detail = UpdateNoSource, err.Error()
+			continue
+		}
 		if err != nil {
 			res.State, res.Detail = UpdateError, err.Error()
 			continue
@@ -380,26 +402,18 @@ func fileChange(rel, status, oldPath, newPath string) FileChange {
 	return fc
 }
 
-// applyMerge stages the merged tree and swaps it into place.
+// applyMerge applies the planned file changes to the store in place, so
+// files outside the merge (including a .git directory) are left alone.
+// Every upstream file is already staged, so only local I/O can fail here.
 func applyMerge(dst, upstream string, m *merge) error {
-	tmp, err := os.MkdirTemp(filepath.Dir(dst), ".agentctl-merge-")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(tmp)
-	merged := filepath.Join(tmp, "asset")
-	if err := fsx.CopyTree(dst, merged); err != nil {
-		return err
-	}
 	for _, rel := range m.del {
-		if err := os.Remove(filepath.Join(merged, filepath.FromSlash(rel))); err != nil && !fsx.IsNotExist(err) {
+		if err := os.Remove(filepath.Join(dst, filepath.FromSlash(rel))); err != nil && !fsx.IsNotExist(err) {
 			return err
 		}
 	}
 	for _, rel := range m.take {
 		src := filepath.Join(upstream, filepath.FromSlash(rel))
-		out := filepath.Join(merged, filepath.FromSlash(rel))
-		os.Remove(out)
+		out := filepath.Join(dst, filepath.FromSlash(rel))
 		if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
 			return err
 		}
@@ -408,20 +422,28 @@ func applyMerge(dst, upstream string, m *merge) error {
 			if err != nil {
 				return err
 			}
+			os.Remove(out)
 			if err := os.Symlink(t, out); err != nil {
 				return err
 			}
 			continue
 		}
+		b, err := os.ReadFile(src)
+		if err != nil {
+			return err
+		}
 		fi, err := os.Stat(src)
 		if err != nil {
 			return err
 		}
-		if err := fsx.CopyFile(src, out, fi.Mode()); err != nil {
+		if fsx.IsSymlink(out) {
+			os.Remove(out)
+		}
+		if err := fsx.WriteFileAtomic(out, b, fi.Mode().Perm()); err != nil {
 			return err
 		}
 	}
-	return fsx.ReplaceTree(merged, dst)
+	return nil
 }
 
 func shortRev(r string) string {

@@ -19,16 +19,19 @@ type State struct {
 
 // Deployment records one thing agentctl put in place.
 type Deployment struct {
-	Target     string    `json:"target"`
-	Project    string    `json:"project,omitempty"`
-	Asset      string    `json:"asset"`
-	Method     string    `json:"method"`
-	Dest       string    `json:"dest,omitempty"`
-	Key        string    `json:"key,omitempty"`
-	SourceHash string    `json:"source_hash,omitempty"`
-	DestHash   string    `json:"dest_hash,omitempty"`
-	Manual     bool      `json:"manual,omitempty"`
-	At         time.Time `json:"at"`
+	Target     string `json:"target"`
+	Project    string `json:"project,omitempty"`
+	Asset      string `json:"asset"`
+	Method     string `json:"method"`
+	Dest       string `json:"dest,omitempty"`
+	Key        string `json:"key,omitempty"`
+	SourceHash string `json:"source_hash,omitempty"`
+	DestHash   string `json:"dest_hash,omitempty"`
+	// Value is the config entry agentctl wrote or asked for (with ${VAR}
+	// placeholders); a client entry matching it is agentctl's.
+	Value  json.RawMessage `json:"value,omitempty"`
+	Manual bool            `json:"manual,omitempty"`
+	At     time.Time       `json:"at"`
 }
 
 // Ack records a manual step the user confirmed.

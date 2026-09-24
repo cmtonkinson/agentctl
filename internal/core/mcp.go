@@ -3,8 +3,9 @@ package core
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
-	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -58,24 +59,6 @@ func canonicalHash(raw json.RawMessage) string {
 	return fsx.HashBytes(b)
 }
 
-// ownershipHash identifies an entry agentctl wrote while ignoring env and
-// header values, which users fill in with credentials after deployment.
-func ownershipHash(raw json.RawMessage) string {
-	var v map[string]any
-	if len(raw) == 0 || json.Unmarshal(raw, &v) != nil {
-		return canonicalHash(raw)
-	}
-	for _, field := range []string{"env", "headers"} {
-		if m, ok := v[field].(map[string]any); ok {
-			for k := range m {
-				m[k] = ""
-			}
-		}
-	}
-	b, _ := json.Marshal(v)
-	return fsx.HashBytes(b)
-}
-
 func isPlaceholder(s string) bool { return strings.Contains(s, "${") }
 
 func placeholders(m *MCPServer) []string {
@@ -91,21 +74,43 @@ func placeholders(m *MCPServer) []string {
 	return out
 }
 
-// mcpMatch compares a desired definition with a client's entry. Values that
-// are ${VAR} placeholders match any value the client holds, since
-// credentials live in the client.
+var placeholderRe = regexp.MustCompile(`\$\{[^}]*\}`)
+
+// wildMatch matches have against want, where each ${VAR} in want matches
+// any text: credentials live in the client, not the store.
+func wildMatch(want, have string) bool {
+	if !isPlaceholder(want) {
+		return want == have
+	}
+	parts := placeholderRe.Split(want, -1)
+	for i, p := range parts {
+		parts[i] = regexp.QuoteMeta(p)
+	}
+	re, err := regexp.Compile("^" + strings.Join(parts, ".*") + "$")
+	return err == nil && re.MatchString(have)
+}
+
+// mcpMatch compares a desired definition with a client's entry. Parts that
+// are ${VAR} placeholders match any value the client holds. Fields the
+// client adds (such as "type": "stdio") are ignored.
 func mcpMatch(want, have json.RawMessage) bool {
 	var w, h map[string]any
 	if json.Unmarshal(want, &w) != nil || json.Unmarshal(have, &h) != nil {
 		return false
 	}
 	for _, k := range []string{"command", "url"} {
-		if str(w[k]) != str(h[k]) {
+		if !wildMatch(str(w[k]), str(h[k])) {
 			return false
 		}
 	}
-	if !reflect.DeepEqual(asStrings(w["args"]), asStrings(h["args"])) {
+	wa, ha := asStrings(w["args"]), asStrings(h["args"])
+	if len(wa) != len(ha) {
 		return false
+	}
+	for i := range wa {
+		if !wildMatch(wa[i], ha[i]) {
+			return false
+		}
 	}
 	wt, ht := str(w["type"]), str(h["type"])
 	if wt != "" && ht != "" && wt != ht && !(wt == "http" && ht == "streamable-http") {
@@ -116,10 +121,7 @@ func mcpMatch(want, have json.RawMessage) bool {
 		hm, _ := h[field].(map[string]any)
 		for k, wv := range wm {
 			hv, ok := hm[k]
-			if !ok {
-				return false
-			}
-			if ws := str(wv); !isPlaceholder(ws) && ws != str(hv) {
+			if !ok || !wildMatch(str(wv), str(hv)) {
 				return false
 			}
 		}
@@ -137,21 +139,37 @@ func asStrings(v any) []string {
 	return out
 }
 
-// preserveCredentials keeps a client's concrete values for keys the store
-// holds only as placeholders.
+// preserveCredentials keeps a client's concrete values wherever the store
+// holds a placeholder and the client's value fits it.
 func preserveCredentials(want, existing json.RawMessage) json.RawMessage {
 	var w, e map[string]any
 	if json.Unmarshal(want, &w) != nil || json.Unmarshal(existing, &e) != nil {
 		return want
 	}
+	keep := func(wv, ev any) bool {
+		ws, es := str(wv), str(ev)
+		return isPlaceholder(ws) && !isPlaceholder(es) && es != "" && wildMatch(ws, es)
+	}
 	for _, field := range []string{"env", "headers"} {
 		wm, _ := w[field].(map[string]any)
 		em, _ := e[field].(map[string]any)
 		for k, wv := range wm {
-			if ev, ok := em[k]; ok && isPlaceholder(str(wv)) && !isPlaceholder(str(ev)) {
+			if ev, ok := em[k]; ok && keep(wv, ev) {
 				wm[k] = ev
 			}
 		}
+	}
+	if wa, ok := w["args"].([]any); ok {
+		if ea, ok := e["args"].([]any); ok && len(ea) == len(wa) {
+			for i := range wa {
+				if keep(wa[i], ea[i]) {
+					wa[i] = ea[i]
+				}
+			}
+		}
+	}
+	if keep(w["url"], e["url"]) {
+		w["url"] = e["url"]
 	}
 	b, _ := json.Marshal(w)
 	return b
@@ -255,7 +273,7 @@ func (a *App) evalConfig(e *Eval) {
 		e.State, e.Detail = StateOK, "configured in "+a.Abbrev(u.Dest)
 	case mcpMatch(u.value, have):
 		e.State, e.Detail, e.adoptable = StateConflict, "unmanaged entry identical to the store (deploy --adopt takes it over)", true
-	case rec != nil && rec.DestHash == ownershipHash(have):
+	case rec != nil && rec.Value != nil && mcpMatch(rec.Value, have):
 		e.State, e.Detail = StateOutdated, "store changed since deployment"
 	default:
 		e.State, e.Detail = StateConflict, "configured differently in "+a.Abbrev(u.Dest)
@@ -398,30 +416,151 @@ func readCodexServers(file string) (map[string]json.RawMessage, error) {
 	return out, nil
 }
 
+var (
+	secretNameRe  = regexp.MustCompile(`(?i)(^|[-_.])(api[-_]?key|apikey|key|token|access[-_]?token|secret|client[-_]?secret|password|passwd|pwd|auth|authorization|credentials?|bearer|sig|signature)$`)
+	secretValueRe = regexp.MustCompile(`^(sk-|sk_|pk_live_|rk_live_|ghp_|gho_|ghu_|ghs_|github_pat_|glpat-|xox[abposr]-|AKIA|AIza|ya29\.|eyJ|Bearer )`)
+)
+
+func envName(s string) string {
+	s = strings.ToUpper(strings.Trim(s, "-_. "))
+	s = strings.NewReplacer("-", "_", ".", "_", " ", "_").Replace(s)
+	if s == "" {
+		return "SECRET"
+	}
+	return s
+}
+
+// looksSecret flags values that are credentials by shape.
+func looksSecret(v string) bool {
+	return secretValueRe.MatchString(v)
+}
+
+// scrubArgs replaces credential-looking command arguments with placeholders.
+func scrubArgs(args []string) ([]string, []string) {
+	out := append([]string(nil), args...)
+	var withheld []string
+	for i := 0; i < len(out); i++ {
+		a := out[i]
+		if isPlaceholder(a) {
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			flag, val, hasVal := strings.Cut(a, "=")
+			name := strings.TrimLeft(flag, "-")
+			if hasVal {
+				if val != "" && !isPlaceholder(val) && (secretNameRe.MatchString(name) || looksSecret(val)) {
+					out[i] = flag + "=${" + envName(name) + "}"
+					withheld = append(withheld, "arg "+flag)
+				}
+				continue
+			}
+			if secretNameRe.MatchString(name) && i+1 < len(out) && !strings.HasPrefix(out[i+1], "-") && !isPlaceholder(out[i+1]) {
+				out[i+1] = "${" + envName(name) + "}"
+				withheld = append(withheld, "arg "+flag)
+				i++
+			}
+			continue
+		}
+		if looksSecret(a) {
+			out[i] = "${MCP_SECRET}"
+			withheld = append(withheld, fmt.Sprintf("arg %d", i+1))
+		}
+	}
+	return out, withheld
+}
+
+// scrubURL replaces credentials in a URL (userinfo, secret query values,
+// and token-like path segments) with placeholders.
+func scrubURL(raw string) (string, []string) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return raw, nil
+	}
+	var withheld []string
+	userinfo := ""
+	if u.User != nil {
+		userinfo = "${MCP_URL_USERINFO}@"
+		withheld = append(withheld, "url credentials")
+	}
+	segs := strings.Split(u.EscapedPath(), "/")
+	for i, seg := range segs {
+		if tokenLike(seg) {
+			segs[i] = "${MCP_URL_TOKEN}"
+			withheld = append(withheld, "url path token")
+		}
+	}
+	var q []string
+	if u.RawQuery != "" {
+		for _, pair := range strings.Split(u.RawQuery, "&") {
+			k, v, _ := strings.Cut(pair, "=")
+			dk, _ := url.QueryUnescape(k)
+			dv, _ := url.QueryUnescape(v)
+			if v != "" && !isPlaceholder(dv) && (secretNameRe.MatchString(dk) || looksSecret(dv) || tokenLike(dv)) {
+				pair = k + "=${" + envName(dk) + "}"
+				withheld = append(withheld, "url query "+dk)
+			}
+			q = append(q, pair)
+		}
+	}
+	out := u.Scheme + "://" + userinfo + u.Host + strings.Join(segs, "/")
+	if len(q) > 0 {
+		out += "?" + strings.Join(q, "&")
+	}
+	if u.Fragment != "" {
+		out += "#" + u.EscapedFragment()
+	}
+	return out, withheld
+}
+
+// tokenLike reports whether s looks like a random credential: long, with
+// both letters and digits.
+func tokenLike(s string) bool {
+	if len(s) < 24 || isPlaceholder(s) {
+		return false
+	}
+	letters, digits := false, false
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+			digits = true
+		case r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z':
+			letters = true
+		case r == '-' || r == '_' || r == '.' || r == '~' || r == '%':
+		default:
+			return false
+		}
+	}
+	return letters && digits
+}
+
 // mcpFromClient converts a client's mcpServers entry into a portable
-// definition, replacing credential values with ${VAR} placeholders.
+// definition, replacing credentials (env and header values, secret-looking
+// arguments, and URL tokens) with ${VAR} placeholders.
 func mcpFromClient(raw json.RawMessage) (*MCPServer, []string) {
 	var v map[string]any
 	if json.Unmarshal(raw, &v) != nil {
 		return nil, nil
 	}
-	m := &MCPServer{Command: str(v["command"]), URL: str(v["url"]), Args: asStrings(v["args"])}
+	m := &MCPServer{Command: str(v["command"]), Args: asStrings(v["args"])}
+	var withheld []string
+	var w []string
+	m.Args, w = scrubArgs(m.Args)
+	withheld = append(withheld, w...)
 	if len(m.Args) == 0 {
 		m.Args = nil
 	}
+	m.URL, w = scrubURL(str(v["url"]))
+	withheld = append(withheld, w...)
 	if t := str(v["type"]); t != "" && t != "stdio" {
 		m.Type = t
 	}
-	var withheld []string
 	scrub := func(field string) map[string]string {
 		src, _ := v[field].(map[string]any)
+		if len(src) == 0 && field == "env" {
+			src, _ = v["env_vars"].(map[string]any)
+		}
 		if len(src) == 0 {
-			if field == "env" {
-				src, _ = v["env_vars"].(map[string]any)
-			}
-			if len(src) == 0 {
-				return nil
-			}
+			return nil
 		}
 		out := map[string]string{}
 		for k, val := range src {
@@ -432,16 +571,23 @@ func mcpFromClient(raw json.RawMessage) (*MCPServer, []string) {
 			}
 			ph := k
 			if field == "headers" {
-				ph = strings.ToUpper(SanitizeName(k))
-				ph = strings.ReplaceAll(strings.ReplaceAll(ph, "-", "_"), ".", "_")
+				ph = envName(k)
 			}
 			out[k] = "${" + ph + "}"
-			withheld = append(withheld, k)
+			withheld = append(withheld, field+" "+k)
 		}
 		return out
 	}
 	m.Env = scrub("env")
 	m.Headers = scrub("headers")
 	sort.Strings(withheld)
-	return m, withheld
+	return m, dedupe(withheld)
+}
+
+// describeServer summarizes a (scrubbed) MCP definition.
+func describeServer(m *MCPServer) string {
+	if m.Remote() {
+		return "MCP server at " + m.URL
+	}
+	return "MCP server: " + truncate(strings.Join(append([]string{m.Command}, m.Args...), " "), 60)
 }

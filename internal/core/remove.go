@@ -147,7 +147,11 @@ func (a *App) removeFromTarget(as *Asset, target, project string, dry bool) ([]*
 			switch {
 			case !fsx.Exists(rec.Dest):
 				act(rec.Dest, "removed", "already gone", nil)
-			case err == nil && h == rec.DestHash:
+			case fsx.ContainsGit(rec.Dest):
+				act(rec.Dest, "refused", "contains a .git directory", nil)
+				ok = false
+				continue
+			case err == nil && rec.DestHash != "" && h == rec.DestHash:
 				if !dry {
 					if err := os.RemoveAll(rec.Dest); err != nil {
 						act(rec.Dest, "refused", err.Error(), nil)
@@ -175,7 +179,7 @@ func (a *App) removeFromTarget(as *Asset, target, project string, dry bool) ([]*
 				continue
 			case !found:
 				act(rec.Dest, "removed", "entry already gone", nil)
-			case ownershipHash(have) == rec.DestHash:
+			case rec.Value != nil && mcpMatch(rec.Value, have):
 				if !dry {
 					if err := editJSONEntry(rec.Dest, rec.Key, nil); err != nil {
 						act(rec.Dest, "refused", err.Error(), nil)
@@ -227,7 +231,7 @@ func (a *App) removeInstruction(as *Asset, rec *Deployment, target, project stri
 		act(rec.Dest, "removed", "already gone", nil)
 		return true
 	}
-	if h, _ := fsx.Hash(rec.Dest); h != rec.DestHash && !fsx.IsSymlink(rec.Dest) {
+	if h, err := fsx.Hash(rec.Dest); (err != nil || h != rec.DestHash) && !fsx.IsSymlink(rec.Dest) {
 		act(rec.Dest, "refused", "modified after deployment", nil)
 		return false
 	}
