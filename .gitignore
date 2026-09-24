@@ -1,0 +1,4 @@
+/agentctl
+/dist/
+*.test
+*.out
