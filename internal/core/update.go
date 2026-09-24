@@ -243,6 +243,10 @@ func (a *App) Update(o UpdateOptions) ([]*UpdateResult, error) {
 			continue
 		}
 		dir, h, clean, err := stage(c)
+		if err == nil && as.Kind == Instructions && fsx.IsDir(as.Path) && c.File != "" {
+			clean()
+			dir, h, clean, err = stageLegacyInstruction(c.File)
+		}
 		p.cleanup = append(p.cleanup, clean)
 		if err != nil {
 			res.State, res.Detail = UpdateError, err.Error()
@@ -305,6 +309,9 @@ func (a *App) Update(o UpdateOptions) ([]*UpdateResult, error) {
 		m := p.as.Meta
 		m.SourceHash, m.ImportedHash = p.hash, p.hash
 		m.Files, _ = fsx.FileHashes(p.staged)
+		if p.as.Kind == Instructions && !fsx.IsDir(p.as.Path) {
+			m.Files = nil
+		}
 		m.UpdatedAt = &now
 		if p.c.Version != "" {
 			m.Version = p.c.Version
@@ -322,6 +329,27 @@ func (a *App) Update(o UpdateOptions) ([]*UpdateResult, error) {
 	return results, nil
 }
 
+// stageLegacyInstruction preserves the directory layout of an existing
+// instruction asset while checking its upstream file.
+func stageLegacyInstruction(file string) (string, string, func(), error) {
+	tmp, err := os.MkdirTemp("", "agentctl-instruction-")
+	if err != nil {
+		return "", "", func() {}, err
+	}
+	clean := func() { os.RemoveAll(tmp) }
+	dir := filepath.Join(tmp, "asset")
+	if err := fsx.CopyFile(file, filepath.Join(dir, "AGENTS.md"), 0o644); err != nil {
+		clean()
+		return "", "", func() {}, err
+	}
+	h, err := fsx.Hash(dir)
+	if err != nil {
+		clean()
+		return "", "", func() {}, err
+	}
+	return dir, h, clean, nil
+}
+
 // merge is a file-level three-way merge of upstream changes into the store.
 type merge struct {
 	take, del, conflicts          []string
@@ -333,6 +361,29 @@ type merge struct {
 // and a fresh upstream copy. Upstream changes to files untouched locally
 // are taken; local changes are kept; files changed on both sides conflict.
 func planMerge(as *Asset, upstream string) (*merge, error) {
+	if as.Kind == Instructions && !fsx.IsDir(as.Path) {
+		local, err := fsx.Hash(as.Path)
+		if err != nil {
+			return nil, err
+		}
+		up, err := fsx.Hash(upstream)
+		if err != nil {
+			return nil, err
+		}
+		base := as.Meta.ImportedHash
+		m := &merge{localChanged: local != base, upstreamChanged: up != base}
+		if up != local && up != base {
+			status := "modified"
+			if local != base {
+				status = "conflict"
+				m.conflicts = []string{filepath.Base(as.Path)}
+			} else {
+				m.take = []string{filepath.Base(as.Path)}
+			}
+			m.changes = []FileChange{fileChange(filepath.Base(as.Path), status, as.Path, upstream)}
+		}
+		return m, nil
+	}
 	local, err := fsx.FileHashes(as.Path)
 	if err != nil {
 		return nil, err
@@ -406,6 +457,16 @@ func fileChange(rel, status, oldPath, newPath string) FileChange {
 // files outside the merge (including a .git directory) are left alone.
 // Every upstream file is already staged, so only local I/O can fail here.
 func applyMerge(dst, upstream string, m *merge) error {
+	if !fsx.IsDir(dst) {
+		if len(m.take) == 0 {
+			return nil
+		}
+		b, err := os.ReadFile(upstream)
+		if err != nil {
+			return err
+		}
+		return fsx.WriteFileAtomic(dst, b, 0o644)
+	}
 	for _, rel := range m.del {
 		if err := os.Remove(filepath.Join(dst, filepath.FromSlash(rel))); err != nil && !fsx.IsNotExist(err) {
 			return err
@@ -453,9 +514,9 @@ func shortRev(r string) string {
 	return r
 }
 
-// trashAsset moves a store asset and its meta into .agentctl/trash.
+// trashAsset moves a store asset and its meta into machine-local trash.
 func (a *App) trashAsset(as *Asset) (string, error) {
-	dst := a.Store.Internal("trash", a.Now().UTC().Format("20060102T150405Z"), string(as.Kind), as.Name)
+	dst := filepath.Join(a.TrashDir(), a.Now().UTC().Format("20060102T150405Z"), string(as.Kind), as.Name)
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return "", err
 	}

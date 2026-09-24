@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 
@@ -266,6 +267,9 @@ func (a *App) Support(target string, as *Asset) Support {
 		case Skills:
 			return Support{target, SupportNative, []string{"link", "copy"}, both, nil}
 		case Plugins:
+			if !fsx.Exists(filepath.Join(as.Path, ".claude-plugin", "plugin.json")) {
+				return unsupported(target, "Claude Code needs .claude-plugin/plugin.json for a skills-directory plugin; add that adapter to the canonical plugin")
+			}
 			return Support{target, SupportNative, []string{"link", "copy"}, user, []string{
 				"Placed in the skills directory, where Claude Code loads it as " + as.Name + "@skills-dir."}}
 		case Tools:
@@ -283,7 +287,7 @@ func (a *App) Support(target string, as *Asset) Support {
 			}
 			return s
 		case Plugins:
-			return unsupported(target, "Codex plugin packages are not supported; assign the plugin's skills and tools individually.")
+			return a.openAIPluginSupport(target, as)
 		case Tools:
 			return a.toolSupport(target, as)
 		}
@@ -296,6 +300,9 @@ func (a *App) Support(target string, as *Asset) Support {
 			return Support{target, SupportPackage, []string{"package"}, account, []string{
 				"Packaged as a ZIP for upload in claude.ai Settings → Capabilities → Skills; confirm with `target acknowledge`."}}
 		case Plugins:
+			if !fsx.Exists(filepath.Join(as.Path, ".claude-plugin", "plugin.json")) {
+				return unsupported(target, "Claude Desktop plugin upload needs a Claude plugin manifest; add .claude-plugin/plugin.json to the canonical plugin")
+			}
 			return Support{target, SupportPackage, []string{"package"}, account, []string{
 				"Packaged as a ZIP for upload in the Claude desktop app; confirm with `target acknowledge`."}}
 		case Tools:
@@ -308,14 +315,26 @@ func (a *App) Support(target string, as *Asset) Support {
 				"Written to a text file to paste into ChatGPT custom instructions (1,500 characters per field)."}}
 		case Skills:
 			return Support{target, SupportPackage, []string{"package"}, account, []string{
-				"Packaged as a ZIP for upload where your ChatGPT plan offers skills; confirm with `target acknowledge`."}}
+				"Packaged as a ZIP for a supported ChatGPT workspace Skills flow; for ChatGPT Chat and Work, bundle it in a plugin. Confirm only after installation."}}
 		case Plugins:
-			return unsupported(target, "ChatGPT does not accept plugin packages; package the plugin's skills individually.")
+			return a.openAIPluginSupport(target, as)
 		case Tools:
 			return a.toolSupport(target, as)
 		}
 	}
 	return unsupported(target, "unknown target or kind")
+}
+
+// openAIPluginSupport checks for a manifest Codex and ChatGPT can load.
+func (a *App) openAIPluginSupport(target string, as *Asset) Support {
+	for _, name := range []string{"plugin.json", filepath.Join(".codex-plugin", "plugin.json")} {
+		if info, err := os.Stat(filepath.Join(as.Path, name)); err == nil && !info.IsDir() {
+			return Support{target, SupportManual, []string{MethodManual}, []string{ScopeUser}, []string{
+				"Add the plugin to the personal marketplace, then install it in the ChatGPT Plugins Directory. Record the completed installation with target acknowledge.",
+			}}
+		}
+	}
+	return unsupported(target, "this plugin only has a Claude manifest; add a portable root plugin.json or .codex-plugin/plugin.json before assigning it to Codex or ChatGPT")
 }
 
 func (a *App) toolSupport(target string, as *Asset) Support {

@@ -16,7 +16,8 @@ import (
 
 // Store is the authoritative asset store (default ~/.agents).
 //
-//	<root>/instructions/<name>/AGENTS.md             shared rules
+//	<root>/instructions/<name>.md                     shared rules
+//	<root>/instructions/<name>/AGENTS.md             shared rules with adapters
 //	<root>/instructions/<name>/targets/<target>.md   optional target adapter
 //	<root>/skills/<name>/SKILL.md
 //	<root>/plugins/<name>/.claude-plugin/plugin.json
@@ -32,8 +33,16 @@ func (s *Store) Internal(parts ...string) string {
 	return filepath.Join(append([]string{s.Root, ".agentctl"}, parts...)...)
 }
 
-// Path returns an asset's directory.
+// Path returns an asset's path. Instructions use a Markdown file unless an
+// adapter-bearing directory with the same name already exists.
 func (s *Store) Path(r Ref) string {
+	if r.Kind == Instructions {
+		dir := filepath.Join(s.Root, string(r.Kind), r.Name)
+		if fsx.IsDir(dir) {
+			return dir
+		}
+		return dir + ".md"
+	}
 	return filepath.Join(s.Root, string(r.Kind), r.Name)
 }
 
@@ -65,6 +74,17 @@ func (a *Asset) Origin() string {
 
 // MainFile returns the path of the file that defines the asset.
 func (a *Asset) MainFile() string {
+	if a.Kind == Instructions && !fsx.IsDir(a.Path) {
+		return a.Path
+	}
+	if a.Kind == Plugins {
+		for _, name := range []string{"plugin.json", ".codex-plugin/plugin.json", ".claude-plugin/plugin.json"} {
+			p := filepath.Join(a.Path, filepath.FromSlash(name))
+			if fsx.Exists(p) {
+				return p
+			}
+		}
+	}
 	return filepath.Join(a.Path, filepath.FromSlash(a.Kind.MainFile()))
 }
 
@@ -116,11 +136,11 @@ func (m *MCPServer) Transport() string {
 
 // Load reads one asset from the store.
 func (s *Store) Load(r Ref) (*Asset, error) {
-	dir := s.Path(r)
-	if !fsx.IsDir(dir) {
+	path := s.Path(r)
+	if !fsx.IsDir(path) && !(r.Kind == Instructions && fsx.Exists(path)) {
 		return nil, fmt.Errorf("%s is not in the store", r)
 	}
-	a := &Asset{Ref: r, Path: dir}
+	a := &Asset{Ref: r, Path: path}
 	if err := a.load(); err != nil {
 		return nil, err
 	}
@@ -172,7 +192,7 @@ func (a *Asset) load() error {
 	case Instructions:
 		b, err := os.ReadFile(a.MainFile())
 		if err != nil {
-			a.Problems = append(a.Problems, "missing AGENTS.md")
+			a.Problems = append(a.Problems, "missing instruction file")
 		} else {
 			a.Description = firstHeading(b)
 		}
@@ -253,6 +273,7 @@ func findExecutables(dir string) []string {
 // List returns every asset in the store, sorted by kind then name.
 func (s *Store) List() ([]*Asset, error) {
 	var out []*Asset
+	seen := map[Ref]bool{}
 	for _, k := range AllKinds {
 		entries, err := os.ReadDir(filepath.Join(s.Root, string(k)))
 		if fsx.IsNotExist(err) {
@@ -262,16 +283,25 @@ func (s *Store) List() ([]*Asset, error) {
 			return nil, err
 		}
 		for _, e := range entries {
-			if strings.HasPrefix(e.Name(), ".") || ValidName(e.Name()) != nil {
+			name := e.Name()
+			if k == Instructions && strings.HasSuffix(name, ".md") && !e.IsDir() {
+				name = strings.TrimSuffix(name, ".md")
+			}
+			if strings.HasPrefix(name, ".") || ValidName(name) != nil {
 				continue
 			}
-			if !fsx.IsDir(filepath.Join(s.Root, string(k), e.Name())) {
+			if !e.IsDir() && !(k == Instructions && strings.HasSuffix(e.Name(), ".md")) {
 				continue
 			}
-			a, err := s.Load(Ref{k, e.Name()})
+			ref := Ref{k, name}
+			if seen[ref] {
+				continue
+			}
+			a, err := s.Load(ref)
 			if err != nil {
 				return nil, err
 			}
+			seen[ref] = true
 			out = append(out, a)
 		}
 	}
@@ -292,7 +322,7 @@ func (s *Store) Find(ref string, kind Kind) (*Asset, error) {
 	}
 	var found []Ref
 	for _, k := range AllKinds {
-		if fsx.IsDir(s.Path(Ref{k, r.Name})) {
+		if fsx.Exists(s.Path(Ref{k, r.Name})) {
 			found = append(found, Ref{k, r.Name})
 		}
 	}

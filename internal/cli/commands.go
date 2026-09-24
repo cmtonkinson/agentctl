@@ -20,16 +20,18 @@ func newInventoryCmd(g *globals) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "inventory [OPTIONS]",
 		Short: "Discover assets across local files and connected accounts",
-		Long: `Discover instructions, skills, plugins, and tools in each target's files, and
-the uploads recorded for account targets. Each item has an ID that
-'agentctl import' accepts.
+		Long: `Discover instructions, skills, plugins, and tools in each target's files,
+Claude's local account snapshots, and recorded account uploads. Importable
+local items have IDs accepted by 'agentctl import'; account snapshots remain
+application-managed and may be incomplete.
 
 Status column:
   managed     deployed by agentctl from the store
   in-store    the store holds identical content
   differs     the store has an asset with this name but different content
   unmanaged   absent from the store
-  recorded    an acknowledged upload to an account target`,
+  recorded    an acknowledged upload to an account target
+  snapshot    an application-managed account cache entry`,
 		Example: `  agentctl inventory --target claude-chat --kind skills
   agentctl inventory --unmanaged
   agentctl inventory --duplicates
@@ -625,7 +627,7 @@ until verified or explicitly recorded with 'target acknowledge'.
 Naming an asset and a target it is not assigned to also assigns it.
 Refuses to overwrite files agentctl did not deploy. --adopt takes over an
 unmanaged copy only when it is identical to the store; the original is
-moved to <store>/.agentctl/trash.`,
+moved to the machine-local agentctl trash.`,
 		Example: `  agentctl deploy --target claude-code --all --dry-run
   agentctl deploy morning-brief --target claude-chat --method package
   agentctl deploy --all --check`,
@@ -932,7 +934,7 @@ func newRemoveCmd(g *globals) *cobra.Command {
 		Use:   "remove ASSET [OPTIONS]",
 		Short: "Remove an asset from the store or a target",
 		Long: `Remove an asset's managed deployment from a target (and unassign it), or
-remove the asset from the store (moved to <store>/.agentctl/trash).
+remove the asset from the store (moved to the machine-local agentctl trash).
 
 Requires an explicit destination.
 Refuses to remove unmanaged or independently modified files.

@@ -147,7 +147,7 @@ func TestDeployLinksAndNeverOverwritesUnmanaged(t *testing.T) {
 	if st := e.status("claude-code")["skills/prune"]; st.State != StateOK {
 		t.Fatalf("expected ok, got %s (%s)", st.State, st.Detail)
 	}
-	trash, _ := filepath.Glob(e.a.Store.Internal("trash", "*", "adopted"))
+	trash, _ := filepath.Glob(filepath.Join(e.a.TrashDir(), "*", "adopted"))
 	if len(trash) != 1 {
 		t.Fatal("adopted original was not kept in trash")
 	}
@@ -206,6 +206,13 @@ func TestInstructionsComposeWithAdapter(t *testing.T) {
 	e := newEnv(t)
 	e.a.Import(e.write("a/AGENTS.md", "# Core\nBe terse."), ImportOptions{Name: "core"})
 	e.a.Import(e.write("b/AGENTS.md", "# Style\nNo emoji."), ImportOptions{Name: "style"})
+	style := e.a.Store.Path(Ref{Instructions, "style"})
+	if err := os.MkdirAll(strings.TrimSuffix(style, ".md"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(style, filepath.Join(strings.TrimSuffix(style, ".md"), "AGENTS.md")); err != nil {
+		t.Fatal(err)
+	}
 	os.MkdirAll(filepath.Join(e.a.Store.Path(Ref{Instructions, "style"}), "targets"), 0o755)
 	os.WriteFile(filepath.Join(e.a.Store.Path(Ref{Instructions, "style"}), "targets", "codex.md"), []byte("Codex only."), 0o644)
 
@@ -234,6 +241,93 @@ func TestInstructionsComposeWithAdapter(t *testing.T) {
 	}
 	if !fsx.IsSymlink(filepath.Join(e.home, ".codex", "AGENTS.md")) {
 		t.Fatal("expected AGENTS.md to become a link to the remaining asset")
+	}
+}
+
+func TestFlatInstructionsAreListedAndDeployed(t *testing.T) {
+	e := newEnv(t)
+	source := e.write(".agents/instructions/agents.md", "# Agents\nFollow general.md.\n")
+	e.write(".agents/instructions/general.md", "# General\nBe precise.\n")
+	assets, err := e.a.Store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found int
+	for _, asset := range assets {
+		if asset.Kind == Instructions {
+			found++
+		}
+	}
+	if found != 2 {
+		t.Fatalf("expected two flat instructions, found %d", found)
+	}
+	asset, err := e.a.Store.Find("instructions/agents", "")
+	if err != nil || asset.MainFile() != source {
+		t.Fatalf("flat instruction resolution: %v, %+v", err, asset)
+	}
+	e.a.Config.Assign("codex", "", "instructions/agents")
+	res := e.deploy(DeployOptions{All: true, Selection: Selection{Targets: []string{"codex"}}})
+	if res.Failed() || !fsx.IsSymlink(filepath.Join(e.home, ".codex", "AGENTS.md")) {
+		t.Fatalf("flat instruction deployment: %+v", res.Evals)
+	}
+}
+
+func TestImportInstructionUsesFlatStoreFileAndUpdates(t *testing.T) {
+	e := newEnv(t)
+	source := e.write("source/rules.md", "# Rules\nFirst.\n")
+	res, err := e.a.Import(source, ImportOptions{})
+	if err != nil || len(res) != 1 || res[0].Asset != "instructions/rules" {
+		t.Fatalf("import: %+v, %v", res, err)
+	}
+	stored := e.a.Store.Path(Ref{Instructions, "rules"})
+	if filepath.Base(stored) != "rules.md" {
+		t.Fatalf("unexpected instruction path: %s", stored)
+	}
+	if b, err := os.ReadFile(stored); err != nil || string(b) != "# Rules\nFirst.\n" {
+		t.Fatalf("stored content: %q, %v", b, err)
+	}
+	e.write("source/rules.md", "# Rules\nSecond.\n")
+	updates, err := e.a.Update(UpdateOptions{Apply: true})
+	if err != nil || len(updates) != 1 || updates[0].State != UpdateApplied {
+		t.Fatalf("update: %+v, %v", updates, err)
+	}
+	if b, _ := os.ReadFile(stored); string(b) != "# Rules\nSecond.\n" {
+		t.Fatalf("updated content: %q", b)
+	}
+}
+
+func TestStoreLoadsPortableAndLegacyPluginManifests(t *testing.T) {
+	e := newEnv(t)
+	for _, tc := range []struct{ name, manifest string }{
+		{"portable", "plugin.json"},
+		{"codex-legacy", ".codex-plugin/plugin.json"},
+		{"claude-legacy", ".claude-plugin/plugin.json"},
+	} {
+		path := filepath.Join(e.a.Store.Path(Ref{Plugins, tc.name}), tc.manifest)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(`{"name":"`+tc.name+`","description":"test plugin"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		asset, err := e.a.Store.Load(Ref{Plugins, tc.name})
+		if err != nil || asset.MainFile() != path || asset.Description != "test plugin" || len(asset.Problems) != 0 {
+			t.Fatalf("%s: asset=%+v err=%v", tc.name, asset, err)
+		}
+	}
+}
+
+func TestImportFromTargetAllDefaultsToPersonalOrigin(t *testing.T) {
+	e := newEnv(t)
+	e.skill(".codex/skills/personal", "personal", "Mine.")
+	e.skill(".codex/skills/.system/system", "system", "Bundled.")
+	res, err := e.a.Import("", ImportOptions{From: "codex", All: true})
+	if err != nil || len(res) != 1 || res[0].Asset != "skills/personal" {
+		t.Fatalf("default import: %+v, %v", res, err)
+	}
+	res, err = e.a.Import("", ImportOptions{From: "codex", All: true, Selection: Selection{Origin: OriginSystem}})
+	if err != nil || len(res) != 1 || res[0].Asset != "skills/system" || res[0].Origin != OriginSystem {
+		t.Fatalf("explicit system import: %+v, %v", res, err)
 	}
 }
 
@@ -509,7 +603,7 @@ func TestUpdateIgnoresSourceThatIsNowAManagedDeployment(t *testing.T) {
 			t.Fatalf("expected no-source, got %s (%s)", r.State, r.Detail)
 		}
 	}
-	b, _ := os.ReadFile(filepath.Join(e.a.Store.Path(Ref{Instructions, "mine"}), "AGENTS.md"))
+	b, _ := os.ReadFile(e.a.Store.Path(Ref{Instructions, "mine"}))
 	if string(b) != "# Mine\n" {
 		t.Fatalf("generated file leaked into the store:\n%s", b)
 	}

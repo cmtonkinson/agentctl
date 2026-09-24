@@ -301,7 +301,7 @@ func (a *App) removeFromStore(as *Asset, clearedTargets []string, dry bool) ([]*
 		}
 	}
 	if dry {
-		out = append(out, &RemoveAction{Path: a.Abbrev(as.Path), Action: "would trash", Detail: "moved to " + a.Abbrev(a.Store.Internal("trash"))})
+		out = append(out, &RemoveAction{Path: a.Abbrev(as.Path), Action: "would trash", Detail: "moved to " + a.Abbrev(a.TrashDir())})
 		return out, nil
 	}
 	if err := a.SaveConfig(); err != nil {

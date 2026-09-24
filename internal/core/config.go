@@ -197,7 +197,7 @@ var ConfigKeys = [][2]string{
 	{"editor", "Editor command for `agentctl edit` [$VISUAL, $EDITOR, vi]"},
 	{"bin-dir", "Where script tools are linked for local targets [~/.local/bin]"},
 	{"deploy.method", "Default deploy method: auto | link | copy | package [auto]"},
-	{"deploy.output", "Default output directory for generated packages [<store>/.agentctl/packages]"},
+	{"deploy.output", "Default output directory for generated packages [<state-dir>/agentctl/<store-id>/packages]"},
 	{"exclude", "Excluded source paths (read-only here; use `config exclude`)"},
 	{"targets.<target>.enabled", "Whether a target is selected by default [true]"},
 	{"targets.<target>.assets", "Assets assigned to a target (read-only here; use `target assign`)"},

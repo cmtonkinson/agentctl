@@ -9,7 +9,7 @@ import (
 	"github.com/cmtonkinson/agentctl/internal/fsx"
 )
 
-// State is machine-local bookkeeping in <store>/.agentctl/state.json: what
+// State is machine-local bookkeeping in the XDG state directory: what
 // agentctl deployed where, and which manual uploads were acknowledged.
 type State struct {
 	Version     int           `json:"version"`

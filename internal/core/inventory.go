@@ -46,6 +46,7 @@ const (
 	ItemDiffers   = "differs"
 	ItemUnmanaged = "unmanaged"
 	ItemRecorded  = "recorded"
+	ItemSnapshot  = "snapshot"
 )
 
 // InventoryOptions configures discovery.
@@ -137,7 +138,7 @@ func (c *collector) keep(it *Item) bool {
 	if o.Scope != "" && it.Scope != o.Scope {
 		return false
 	}
-	if it.Cached && !o.IncludeCache {
+	if it.Cached && it.Scope != ScopeAccount && !o.IncludeCache {
 		return false
 	}
 	return !Excluded(it.Path, c.excludes)
@@ -261,6 +262,9 @@ func (c *collector) skill(target, project, dir, origin, plugin string) {
 func (c *collector) plugin(target, project, dir, origin, id string, cached bool) {
 	m, err := readJSONMap(filepath.Join(dir, ".claude-plugin", "plugin.json"))
 	name := filepath.Base(dir)
+	if id != "" {
+		name = strings.SplitN(id, "@", 2)[0]
+	}
 	var version, desc string
 	if err == nil {
 		if n := str(m["name"]); n != "" {
@@ -271,6 +275,10 @@ func (c *collector) plugin(target, project, dir, origin, id string, cached bool)
 	it := c.add(&Item{Target: target, Scope: scope(project), Project: c.projectKey(project), Kind: Plugins, Name: name, Origin: origin, Path: dir, Version: version, Description: desc, Cached: cached})
 	if id != "" {
 		it.Note = id
+	}
+	if err != nil {
+		it.Note += " (cache has no plugin manifest)"
+		it.importable = false
 	}
 	if cached || (fsx.IsSymlink(dir) && linksIntoStore(c.a, dir)) {
 		return // cached copies and agentctl's own deployments are not expanded
@@ -438,6 +446,9 @@ func (c *collector) codex(projects []string) {
 	if !fsx.SamePath(p["legacy-skills"], p["skills"]) {
 		c.skillsDir(t, "", p["legacy-skills"], OriginPersonal)
 	}
+	if c.opts.IncludeCache {
+		c.codexPluginCache(filepath.Join(p["home"], "plugins", "cache"))
+	}
 	servers, err := readCodexServers(p["config"])
 	if err != nil {
 		c.note("codex: %v", err)
@@ -449,6 +460,53 @@ func (c *collector) codex(projects []string) {
 		c.instructionFile(t, proj, filepath.Join(proj, "AGENTS.md"), filepath.Base(proj))
 		c.skillsDir(t, proj, filepath.Join(proj, ".agents", "skills"), OriginPersonal)
 		c.skillsDir(t, proj, filepath.Join(proj, ".codex", "skills"), OriginPersonal)
+	}
+}
+
+// codexPluginCache lists application-managed plugin copies without treating
+// them as owned source or proof that a plugin is enabled.
+func (c *collector) codexPluginCache(root string) {
+	dirs, _ := filepath.Glob(filepath.Join(root, "*", "*", "*"))
+	for _, dir := range dirs {
+		var manifest map[string]any
+		for _, rel := range []string{"plugin.json", ".codex-plugin/plugin.json"} {
+			m, err := readJSONMap(filepath.Join(dir, rel))
+			if err == nil {
+				manifest = m
+				break
+			}
+		}
+		if manifest == nil {
+			continue
+		}
+		name := filepath.Base(filepath.Dir(dir))
+		if ValidName(name) != nil {
+			continue
+		}
+		origin := OriginThirdParty
+		if filepath.Base(filepath.Dir(filepath.Dir(dir))) == "created-by-me-remote" {
+			origin = OriginPersonal
+		}
+		it := c.add(&Item{Target: "codex", Scope: ScopeUser, Kind: Plugins, Name: name, Origin: origin,
+			Path: dir, Version: firstNonEmpty(str(manifest["version"]), filepath.Base(dir)),
+			Description: str(manifest["description"]), Cached: true, Note: "Codex-managed plugin cache"})
+		it.importable = false
+		skills, _ := os.ReadDir(filepath.Join(dir, "skills"))
+		for _, skill := range skills {
+			path := filepath.Join(dir, "skills", skill.Name())
+			if !skill.IsDir() || !fsx.Exists(filepath.Join(path, "SKILL.md")) {
+				continue
+			}
+			fm, _, _ := ReadFrontmatter(filepath.Join(path, "SKILL.md"))
+			skillName := firstNonEmpty(str(fm["name"]), skill.Name())
+			if ValidName(skillName) != nil {
+				continue
+			}
+			entry := c.add(&Item{Target: "codex", Scope: ScopeUser, Kind: Skills, Name: skillName, Origin: origin,
+				Path: path, Plugin: name, Description: str(fm["description"]), Cached: true,
+				Note: "Codex-managed plugin skill cache"})
+			entry.importable = false
+		}
 	}
 }
 
@@ -473,8 +531,9 @@ func (c *collector) claudeChat() {
 	t := "claude-chat"
 	p := a.TargetPaths(t)
 	n := c.accountRecords(t)
+	c.claudeAccountSnapshot(filepath.Join(p["app"], "local-agent-mode-sessions"))
 	if c.opts.Refresh || contains(c.opts.Targets, t) {
-		c.note("claude-chat: claude.ai has no API for listing account skills or connectors; showing %d acknowledged upload(s). Download skill ZIPs from claude.ai and import them with `agentctl import FILE.zip`.", n)
+		c.note("claude-chat: local account snapshots may be incomplete or stale; showing them alongside %d acknowledged upload(s). No account listing API is used. Export owned skills from Claude before importing them.", n)
 	}
 	c.mcpServers(t, "", p["desktop-config"], "mcpServers", OriginPersonal, "")
 	entries, _ := os.ReadDir(p["extensions"])
@@ -491,6 +550,95 @@ func (c *collector) claudeChat() {
 		it := c.add(&Item{Target: t, Scope: ScopeUser, Kind: Tools, Name: SanitizeName(name), Origin: OriginThirdParty, Path: dir, Version: str(m["version"]), Description: str(m["description"]), Note: "desktop extension"})
 		it.importable = false
 	}
+}
+
+// claudeAccountSnapshot reads the newest Desktop account snapshot. These are
+// application-managed files, so inventory exposes them but never imports them.
+func (c *collector) claudeAccountSnapshot(root string) {
+	manifests, _ := filepath.Glob(filepath.Join(root, "skills-plugin", "*", "*", "manifest.json"))
+	var latest string
+	var updated float64
+	for _, file := range manifests {
+		m, err := readJSONMap(file)
+		if err != nil {
+			continue
+		}
+		if ts, ok := m["lastUpdated"].(float64); ok && (latest == "" || ts > updated) {
+			latest, updated = file, ts
+		}
+	}
+	if latest == "" {
+		return
+	}
+	m, err := readJSONMap(latest)
+	if err != nil {
+		return
+	}
+	skillsRoot := filepath.Join(filepath.Dir(latest), "skills")
+	for _, raw := range anySlice(m["skills"]) {
+		entry, ok := raw.(map[string]any)
+		if !ok || entry["enabled"] == false {
+			continue
+		}
+		name := str(entry["name"])
+		path := filepath.Join(skillsRoot, name)
+		if ValidName(name) != nil || !fsx.Exists(filepath.Join(path, "SKILL.md")) {
+			continue
+		}
+		origin := OriginThirdParty
+		switch str(entry["creatorType"]) {
+		case "user":
+			origin = OriginPersonal
+		case "anthropic":
+			origin = OriginSystem
+		}
+		c.add(&Item{Target: "claude-chat", Scope: ScopeAccount, Kind: Skills, Name: name, Origin: origin,
+			Path: path, Description: str(entry["description"]), Cached: true, Note: "local account snapshot; export from Claude to import"})
+	}
+	// The account snapshot uses the reverse session-id order for plugin files.
+	ids := strings.Split(filepath.ToSlash(filepath.Dir(latest)), "/")
+	if len(ids) < 2 {
+		return
+	}
+	rpm := filepath.Join(root, ids[len(ids)-1], ids[len(ids)-2], "rpm")
+	dirs, _ := os.ReadDir(rpm)
+	for _, d := range dirs {
+		if !d.IsDir() {
+			continue
+		}
+		pluginPath := filepath.Join(rpm, d.Name())
+		manifest, err := readJSONMap(filepath.Join(pluginPath, ".claude-plugin", "plugin.json"))
+		if err != nil {
+			continue
+		}
+		name := str(manifest["name"])
+		if ValidName(name) != nil {
+			continue
+		}
+		c.add(&Item{Target: "claude-chat", Scope: ScopeAccount, Kind: Plugins, Name: name,
+			Origin: OriginThirdParty, Path: pluginPath, Version: str(manifest["version"]),
+			Description: str(manifest["description"]), Cached: true, Note: "local account plugin snapshot"})
+		skills, _ := os.ReadDir(filepath.Join(pluginPath, "skills"))
+		for _, s := range skills {
+			path := filepath.Join(pluginPath, "skills", s.Name())
+			if !s.IsDir() || !fsx.Exists(filepath.Join(path, "SKILL.md")) {
+				continue
+			}
+			fm, _, _ := ReadFrontmatter(filepath.Join(path, "SKILL.md"))
+			name := firstNonEmpty(str(fm["name"]), s.Name())
+			if ValidName(name) != nil {
+				continue
+			}
+			c.add(&Item{Target: "claude-chat", Scope: ScopeAccount, Kind: Skills, Name: name,
+				Origin: OriginThirdParty, Path: path, Plugin: str(manifest["name"]),
+				Description: str(fm["description"]), Cached: true, Note: "local account plugin snapshot"})
+		}
+	}
+}
+
+func anySlice(v any) []any {
+	x, _ := v.([]any)
+	return x
 }
 
 func (c *collector) chatgpt() {
@@ -523,8 +671,12 @@ func (c *collector) classify() {
 	}
 	for _, it := range c.items {
 		if it.Scope == ScopeAccount {
-			it.Status = ItemRecorded
-			it.StoreRef = string(it.Kind) + "/" + it.Name
+			if it.Path == "" {
+				it.Status = ItemRecorded
+				it.StoreRef = string(it.Kind) + "/" + it.Name
+			} else {
+				it.Status = ItemSnapshot
+			}
 			continue
 		}
 		if it.Path != "" && it.value == nil {

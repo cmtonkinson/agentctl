@@ -4,6 +4,8 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -63,8 +65,12 @@ func Open(storePath string) (*App, error) {
 	if a.Config, err = LoadConfig(a.ConfigPath()); err != nil {
 		return nil, err
 	}
-	if a.State, err = LoadState(a.statePath()); err != nil {
-		return nil, fmt.Errorf("%s: %w", a.statePath(), err)
+	stateFile := a.statePath()
+	if !fsx.Exists(stateFile) && fsx.Exists(a.Store.Internal("state.json")) {
+		stateFile = a.Store.Internal("state.json")
+	}
+	if a.State, err = LoadState(stateFile); err != nil {
+		return nil, fmt.Errorf("%s: %w", stateFile, err)
 	}
 	return a, nil
 }
@@ -92,7 +98,20 @@ func lastLine(s string) string {
 // ConfigPath is <store>/agentctl.yaml.
 func (a *App) ConfigPath() string { return filepath.Join(a.Store.Root, ConfigFile) }
 
-func (a *App) statePath() string { return a.Store.Internal("state.json") }
+// RuntimeDir keeps machine-specific records outside the source store.
+func (a *App) RuntimeDir() string {
+	base := a.Getenv("XDG_STATE_HOME")
+	if base == "" {
+		base = filepath.Join(a.Home, ".local", "state")
+	}
+	sum := sha256.Sum256([]byte(a.Store.Root))
+	return filepath.Join(a.Expand(base), "agentctl", hex.EncodeToString(sum[:6]))
+}
+
+func (a *App) statePath() string { return filepath.Join(a.RuntimeDir(), "state.json") }
+
+// TrashDir holds removed or adopted content for recovery.
+func (a *App) TrashDir() string { return filepath.Join(a.RuntimeDir(), "trash") }
 
 // SaveConfig writes the config file.
 func (a *App) SaveConfig() error { return a.Config.Save(a.ConfigPath()) }
@@ -139,12 +158,13 @@ func (a *App) OutputDir() string {
 	if a.Config.Deploy.Output != "" {
 		return a.AbsPath(a.Config.Deploy.Output)
 	}
-	return a.Store.Internal("packages")
+	return filepath.Join(a.RuntimeDir(), "packages")
 }
 
 // Excludes returns configured plus extra exclude paths, absolutized.
 func (a *App) Excludes(extra []string) []string {
-	var out []string
+	// This project was explicitly excluded from the shared asset migration.
+	out := []string{filepath.Join(a.Home, "mrs-bpo")}
 	for _, e := range append(append([]string{}, a.Config.Exclude...), extra...) {
 		out = append(out, a.AbsPath(e))
 	}

@@ -74,7 +74,7 @@ func (c *candidate) materialize(dst string) error {
 		}
 		return err
 	case c.Kind == Instructions && c.File != "":
-		return fsx.CopyFile(c.File, filepath.Join(dst, "AGENTS.md"), 0o644)
+		return fsx.CopyFile(c.File, dst, 0o644)
 	case c.Kind == Tools && c.File != "":
 		base := filepath.Base(c.File)
 		if err := fsx.CopyFile(c.File, filepath.Join(dst, base), 0o755); err != nil {
@@ -244,6 +244,9 @@ func (a *App) Import(source string, o ImportOptions) ([]*ImportResult, error) {
 		now := a.Now().UTC()
 		src := s.c.Source
 		files, _ := fsx.FileHashes(s.dir)
+		if s.c.Kind == Instructions {
+			files = nil
+		}
 		m := &Meta{Origin: s.c.Origin, Source: &src, License: s.c.License, Version: s.c.Version, ImportedAt: &now, ImportedHash: s.hash, SourceHash: s.hash, Files: files}
 		if len(s.c.Requires) > 0 {
 			m.Requires = &Requires{Assets: s.c.Requires}
@@ -269,6 +272,9 @@ func (a *App) resolveImport(source string, o ImportOptions) ([]*candidate, func(
 		}
 		sel := o.Selection
 		sel.Targets = []string{o.From}
+		if source == "" && o.All && sel.Origin == "" {
+			sel.Origin = OriginPersonal
+		}
 		inv, err := a.Inventory(InventoryOptions{Selection: sel})
 		if err != nil {
 			return nil, noop, err
@@ -444,7 +450,7 @@ func locate(root, rootName string, kind Kind) ([]*candidate, error) {
 				}
 			} else if base == "tool.json" || base == "plugin.json" {
 				dir := filepath.Dir(root)
-				if base == "plugin.json" {
+				if base == "plugin.json" && (filepath.Base(dir) == ".claude-plugin" || filepath.Base(dir) == ".codex-plugin") {
 					dir = filepath.Dir(dir)
 				}
 				if c := dirCandidate(dir, filepath.Base(dir)); c != nil {
@@ -503,16 +509,21 @@ func locate(root, rootName string, kind Kind) ([]*candidate, error) {
 
 // dirCandidate recognizes a directory that is itself an asset.
 func dirCandidate(dir, name string) *candidate {
-	switch {
-	case fsx.Exists(filepath.Join(dir, ".claude-plugin", "plugin.json")):
+	for _, manifest := range []string{"plugin.json", ".codex-plugin/plugin.json", ".claude-plugin/plugin.json"} {
+		file := filepath.Join(dir, filepath.FromSlash(manifest))
+		if !fsx.Exists(file) {
+			continue
+		}
 		c := &candidate{Kind: Plugins, Name: SanitizeName(name), Dir: dir}
-		if m, err := readJSONMap(filepath.Join(dir, ".claude-plugin", "plugin.json")); err == nil {
+		if m, err := readJSONMap(file); err == nil {
 			if n := str(m["name"]); n != "" {
 				c.Name = SanitizeName(n)
 			}
 			c.Version, c.License = str(m["version"]), str(m["license"])
 		}
 		return c
+	}
+	switch {
 	case fsx.Exists(filepath.Join(dir, "SKILL.md")):
 		c := &candidate{Kind: Skills, Name: SanitizeName(name), Dir: dir}
 		if fm, _, err := ReadFrontmatter(filepath.Join(dir, "SKILL.md")); err == nil {

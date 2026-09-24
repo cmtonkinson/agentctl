@@ -204,6 +204,15 @@ func (a *App) planInstructions(base func() *Unit, target, project string, as *As
 	if TargetByName(target).Local {
 		u.Dest = a.scopedPaths(target, project)["instructions"]
 		single := len(group) == 1 && !as.HasAdapter(target)
+		if single {
+			if body, err := os.ReadFile(u.Dest); err == nil && strings.TrimSpace(string(body)) == "Follow instructions at "+a.Abbrev(as.MainFile())+" now." {
+				u.Method = MethodInPlace
+				u.Source = as.MainFile()
+				u.Want, _ = fsx.Hash(u.Source)
+				u.Notes = append(u.Notes, "the existing target pointer loads this canonical instruction file")
+				return []*Unit{u}
+			}
+		}
 		switch {
 		case single && method == MethodLink:
 			u.Method = MethodLink
@@ -256,6 +265,18 @@ func (a *App) planDir(base func() *Unit, target, project string, as *Asset, meth
 	u := base()
 	u.Want, _ = as.Hash()
 	u.Source = as.Path
+	if as.Kind == Plugins && (target == "codex" || target == "chatgpt") {
+		u.Method = MethodManual
+		u.Dest = filepath.Join(a.Store.Root, "plugins", "marketplace.json")
+		u.Key = as.Name
+		u.Steps = []string{
+			"In " + a.Abbrev(u.Dest) + ", create {\"name\":\"agentctl-personal\",\"plugins\":[]} if absent, then add {\"name\":\"" + as.Name + "\",\"source\":{\"source\":\"local\",\"path\":\"./plugins/" + as.Name + "\"}} to plugins[].",
+			"Restart ChatGPT desktop, then install " + as.Name + " from the personal marketplace in the Plugins Directory.",
+			a.ackStep(u),
+		}
+		u.removeSteps = []string{"Remove " + as.Name + " from the personal marketplace and uninstall it in the Plugins Directory."}
+		return []*Unit{u}
+	}
 	if TargetByName(target).Local {
 		key := "skills"
 		if as.Kind == Plugins {
@@ -287,8 +308,8 @@ func (a *App) planDir(base func() *Unit, target, project string, as *Asset, meth
 		u.Steps = []string{"Upload " + a.Abbrev(u.Dest) + " as a plugin in the Claude desktop app."}
 		u.removeSteps = []string{"Remove the " + as.Name + " plugin in the Claude desktop app."}
 	case target == "chatgpt":
-		u.Steps = []string{"Upload " + a.Abbrev(u.Dest) + " as a skill in ChatGPT (where your plan offers skills)."}
-		u.removeSteps = []string{"Delete the " + as.Name + " skill in ChatGPT."}
+		u.Steps = []string{"Use " + a.Abbrev(u.Dest) + " in a supported ChatGPT workspace Skills flow, or bundle this skill in a portable plugin for ChatGPT Chat and Work."}
+		u.removeSteps = []string{"Remove the " + as.Name + " workspace skill or uninstall its plugin in ChatGPT."}
 	}
 	u.Steps = append(u.Steps, a.ackStep(u))
 	return []*Unit{u}
@@ -330,6 +351,9 @@ func (a *App) Evaluate(u *Unit) *Eval {
 	switch u.Method {
 	case MethodInPlace:
 		e.State, e.Detail = StateOK, "read directly from the store"
+		if u.asset != nil && u.asset.Kind == Instructions {
+			e.Detail = "existing pointer loads the store"
+		}
 	case MethodLink:
 		a.evalLink(e)
 	case MethodCopy, MethodGenerate:
@@ -620,7 +644,7 @@ func (a *App) recordOK(e *Eval) {
 // adopting, the unmanaged original is moved to the store's trash instead.
 func (a *App) clearDest(dest string, adopt bool) error {
 	if adopt {
-		trash := a.Store.Internal("trash", a.Now().UTC().Format("20060102T150405Z"), "adopted", strings.TrimPrefix(filepath.ToSlash(dest), "/"))
+		trash := filepath.Join(a.TrashDir(), a.Now().UTC().Format("20060102T150405Z"), "adopted", strings.TrimPrefix(filepath.ToSlash(dest), "/"))
 		if err := os.MkdirAll(filepath.Dir(trash), 0o755); err != nil {
 			return err
 		}

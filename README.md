@@ -20,9 +20,7 @@ overwrites anything it didn't put there.
 Requires Go 1.24+.
 
 ```sh
-go install github.com/cmtonkinson/agentctl/cmd/agentctl@latest
-# or, from a checkout:
-make install            # builds ./agentctl and installs to ~/.local/bin
+make install            # builds and installs to ~/bin
 ```
 
 It is a single static binary with no runtime dependencies. `git` is needed only
@@ -32,8 +30,8 @@ to import from or update against repositories.
 
 ```sh
 agentctl inventory                                   # what's out there?
-agentctl import --from claude-code --all --dry-run   # preview pulling it in
-agentctl import --from claude-code --all
+agentctl import --from claude-code --all --on-conflict skip --dry-run
+agentctl import --from claude-code --all --on-conflict skip
 agentctl target assign claude-code prune-prose format-markdown
 agentctl target assign codex prune-prose
 agentctl deploy --all --dry-run
@@ -44,7 +42,7 @@ agentctl status
 A skill you imported from `~/.claude/skills/foo` is still sitting there, so the
 first deploy reports a **conflict**: agentctl won't replace a directory it didn't
 create. If the copy is identical to the store, `deploy --adopt` swaps it for a
-link and keeps the original under `~/.agents/.agentctl/trash/`. Otherwise,
+link and keeps the original under `~/.local/state/agentctl/<store-id>/trash/`. Otherwise,
 move the original aside yourself.
 
 ## The store
@@ -52,20 +50,22 @@ move the original aside yourself.
 ```
 ~/.agents/
   agentctl.yaml                          configuration (YAML)
-  instructions/<name>/AGENTS.md          shared rules
+  instructions/<name>.md                 shared rules
+  instructions/<name>/AGENTS.md          optional directory layout for adapters
   instructions/<name>/targets/<t>.md     optional adapter appended for target <t>
   skills/<name>/SKILL.md                 plus scripts/, references/, assets/
-  plugins/<name>/.claude-plugin/plugin.json
+  plugins/<name>/plugin.json             portable plugin manifest
+  plugins/<name>/.claude-plugin/plugin.json  Claude-only manifest, if needed
   tools/<name>/tool.json                 MCP server definition and/or scripts
   .agentctl/meta/<kind>/<name>.json      provenance: source, revision, license, hashes
-  .agentctl/state.json                   machine-local: deployments, acknowledgements
-  .agentctl/packages/                    generated upload packages
-  .agentctl/trash/                       removed or adopted files
+~/.local/state/agentctl/<store-id>/
+  state.json                             deployments, acknowledgements
+  packages/                              generated upload packages
+  trash/                                 removed or adopted files
 ```
 
-Asset directories hold exactly what you authored. agentctl's bookkeeping lives
-under `.agentctl/`. If you keep the store in git, consider ignoring
-`.agentctl/state.json`, `.agentctl/packages/`, and `.agentctl/trash/`. agentctl
+Asset directories hold exactly what you authored. Provenance lives under
+`.agentctl/meta/`; machine-specific records stay outside the source store. agentctl
 never commits, pushes, or publishes anything.
 
 A `tool.json` looks like this:
@@ -92,8 +92,8 @@ executables.
 | Kind         | claude-code                         | codex                               | claude-chat                               | chatgpt                          |
 |--------------|-------------------------------------|-------------------------------------|-------------------------------------------|----------------------------------|
 | instructions | `~/.claude/CLAUDE.md` (link / copy / composed) | `~/.codex/AGENTS.md` (link / copy / composed) | text to paste into profile preferences | text to paste into custom instructions (1,500 char check) |
-| skills       | `~/.claude/skills/<name>` (link / copy) | `~/.agents/skills/<name>`, in place when the store is `~/.agents` | ZIP to upload in Settings → Capabilities | ZIP to upload (plan-dependent) |
-| plugins      | `~/.claude/skills/<name>`, loaded as `<name>@skills-dir` | unsupported | ZIP to upload in the desktop app | unsupported |
+| skills       | `~/.claude/skills/<name>` (link / copy) | `~/.agents/skills/<name>`, in place when the store is `~/.agents` | ZIP to upload in Settings → Capabilities | ZIP for supported workspace Skills flows; a plugin is needed for Chat and Work |
+| plugins      | `~/.claude/skills/<name>`, loaded as `<name>@skills-dir` | personal marketplace setup (manual) | ZIP to upload in the desktop app | personal marketplace setup (manual) |
 | MCP tools    | prints `claude mcp add-json`, then verifies `~/.claude.json`; project scope merges `.mcp.json` | prints `codex mcp add`, then verifies `config.toml` | stdio: merged into `claude_desktop_config.json`; remote: custom connector (manual) | remote only: connector (manual) |
 | script tools | linked into `~/.local/bin`          | linked into `~/.local/bin`          | unsupported                               | unsupported                      |
 
@@ -267,12 +267,15 @@ project's `.claude/skills`, `CLAUDE.md`, `AGENTS.md`, `.agents/skills`, and
 
 ## Notes and limitations
 
-- Account inventories can't be read. Neither claude.ai nor ChatGPT exposes an API
-  that lists account skills, instructions, or connectors, so `inventory` shows
-  what you've acknowledged. To pull an account skill in, download its ZIP and
-  import that.
-- Codex plugins aren't supported. Assign a plugin's skills and tools
-  individually.
+- Account inventories cannot be read completely. Claude's local cache supplies
+  partial, read-only skill and plugin snapshots; ChatGPT shows acknowledged
+  assets only. To import an account skill, export its source and import that file.
+- `inventory --target codex --include-cache` shows Codex-managed plugin and
+  skill copies as read-only evidence; cache presence does not prove enablement.
+- Codex and ChatGPT plugins require a portable `plugin.json` or
+  `.codex-plugin/plugin.json`; Claude Code and Claude Desktop plugins require
+  `.claude-plugin/plugin.json`. Keep both manifests in one canonical plugin when
+  deploying it across providers.
 - Codex reads skills from `~/.agents/skills`. With the default store, every
   stored skill is visible to Codex whether assigned or not (`doctor` notes this).
   To make Codex respect assignments, point `targets.codex.paths.skills` somewhere
@@ -285,6 +288,7 @@ project's `.claude/skills`, `CLAUDE.md`, `AGENTS.md`, `.agents/skills`, and
 ## Development
 
 ```sh
+make help    # Makefile targets and options
 make test    # go test ./...
 make vet     # go vet + gofmt check
 make build
