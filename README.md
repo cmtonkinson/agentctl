@@ -1,299 +1,85 @@
 # agentctl
+Keep one dotfiles-managed source of instructions and skills, and see when the
+known live copies diverge.
 
-Manage agent assets (instructions, skills, plugins, and tools) from one
-authoritative store at `~/.agents/`, and deploy them to the agents you use:
+The store is `~/.agents/{instructions,skills}/`. `agents.md` is the
+instruction entrypoint; skill directories contain `SKILL.md` and supporting
+files. `agentctl` only checks user-global Codex and Claude Code locations. It
+does not scan plugin caches, project directories, or the rest of the disk.
 
-| Target        | What it is                        |
-|---------------|-----------------------------------|
-| `chatgpt`     | ChatGPT account and desktop       |
-| `claude-chat` | Claude account and desktop chat   |
-| `codex`       | Codex CLI                         |
-| `claude-code` | Claude Code                       |
-
-agentctl finds the assets already on your machine, copies them into the store
-without touching the originals, and deploys them back out as links, copies,
-config entries, or upload packages. It tracks what it deployed so it never
-overwrites anything it didn't put there.
-
-## Install
-
-Requires Go 1.24+.
-
-```sh
-make install            # builds and installs to ~/bin
-```
-
-It is a single static binary with no runtime dependencies. `git` is needed only
-to import from or update against repositories.
-
-## Quick start
-
-```sh
-agentctl inventory                                   # what's out there?
-agentctl import --from claude-code --all --on-conflict skip --dry-run
-agentctl import --from claude-code --all --on-conflict skip
-agentctl target assign claude-code prune-prose format-markdown
-agentctl target assign codex prune-prose
-agentctl deploy --all --dry-run
-agentctl deploy --all
-agentctl status
-```
-
-A skill you imported from `~/.claude/skills/foo` is still sitting there, so the
-first deploy reports a **conflict**: agentctl won't replace a directory it didn't
-create. If the copy is identical to the store, `deploy --adopt` swaps it for a
-link and keeps the original under `~/.local/state/agentctl/<store-id>/trash/`. Otherwise,
-move the original aside yourself.
-
-## The store
-
-```
-~/.agents/
-  agentctl.yaml                          configuration (YAML)
-  instructions/<name>.md                 shared rules
-  instructions/<name>/AGENTS.md          optional directory layout for adapters
-  instructions/<name>/targets/<t>.md     optional adapter appended for target <t>
-  skills/<name>/SKILL.md                 plus scripts/, references/, assets/
-  plugins/<name>/plugin.json             portable plugin manifest
-  plugins/<name>/.claude-plugin/plugin.json  Claude-only manifest, if needed
-  tools/<name>/tool.json                 MCP server definition and/or scripts
-  .agentctl/meta/<kind>/<name>.json      provenance: source, revision, license, hashes
-~/.local/state/agentctl/<store-id>/
-  state.json                             deployments, acknowledgements
-  packages/                              generated upload packages
-  trash/                                 removed or adopted files
-```
-
-Asset directories hold exactly what you authored. Provenance lives under
-`.agentctl/meta/`; machine-specific records stay outside the source store. agentctl
-never commits, pushes, or publishes anything.
-
-A `tool.json` looks like this:
-
-```json
-{
-  "description": "GitHub MCP server",
-  "mcp": {
-    "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-github"],
-    "env": { "GITHUB_TOKEN": "${GITHUB_TOKEN}" }
-  },
-  "bin": ["bin/gh-helper"],
-  "requires": ["node"]
-}
-```
-
-Remote servers use `"url"` (and optionally `"type": "http"` and `"headers"`)
-instead of `"command"`. A tool directory without `tool.json` is treated as its
-executables.
-
-## How each target is served
-
-| Kind         | claude-code                         | codex                               | claude-chat                               | chatgpt                          |
-|--------------|-------------------------------------|-------------------------------------|-------------------------------------------|----------------------------------|
-| instructions | `~/.claude/CLAUDE.md` (link / copy / composed) | `~/.codex/AGENTS.md` (link / copy / composed) | text to paste into profile preferences | text to paste into custom instructions (1,500 char check) |
-| skills       | `~/.claude/skills/<name>` (link / copy) | `~/.agents/skills/<name>`, in place when the store is `~/.agents` | ZIP to upload in Settings → Capabilities | ZIP for supported workspace Skills flows; a plugin is needed for Chat and Work |
-| plugins      | `~/.claude/skills/<name>`, loaded as `<name>@skills-dir` | personal marketplace setup (manual) | ZIP to upload in the desktop app | personal marketplace setup (manual) |
-| MCP tools    | prints `claude mcp add-json`, then verifies `~/.claude.json`; project scope merges `.mcp.json` | prints `codex mcp add`, then verifies `config.toml` | stdio: merged into `claude_desktop_config.json`; remote: custom connector (manual) | remote only: connector (manual) |
-| script tools | linked into `~/.local/bin`          | linked into `~/.local/bin`          | unsupported                               | unsupported                      |
-
-`agentctl target show TARGET` prints the resolved paths. Override any of them with
-`agentctl config set targets.<target>.paths.<key> PATH`. `$CLAUDE_CONFIG_DIR`,
-`$CODEX_HOME`, `$XDG_CONFIG_HOME`, and `$APPDATA` are respected.
-
-### Instructions
-
-When one instruction asset is assigned to a target and it has no adapter,
-agentctl links it directly. When several are assigned, or an asset has a
-`targets/<target>.md` adapter, they are joined in assignment order into one
-generated file with a header comment. Removing one asset from a target rewrites
-the file from the rest.
-
-### Upload-only targets and acknowledgements
-
-claude.ai and ChatGPT don't let you install anything through an API, so
-agentctl builds a self-contained package (deterministic ZIP or text file) and
-prints the manual steps, ending with:
-
-```
-→ Then record it: agentctl target acknowledge claude-chat skills/morning-brief --hash 1a2b3c4d5e6f
-```
-
-Until you acknowledge it, the asset reports `manual`, not `ok`. If the store
-changes afterwards, it reports `outdated`. The same applies to MCP commands
-agentctl asks you to run. Where it can read the client's config back (Claude
-Code, Codex, Claude Desktop), it verifies the entry instead of relying on your
-acknowledgement.
-
-### Credentials
-
-Importing an MCP server from a client config replaces credentials with
-`${VAR}` placeholders, so secrets never enter the store. That covers env and
-header values, arguments after flags like `--token` or `--api-key`, values
-that look like keys (`sk-…`, `ghp_…`, and so on), secret query parameters, and
-token-like URL path segments. When deploying, a placeholder matches whatever
-value the client already holds, and a merge into `claude_desktop_config.json`
-keeps the credentials already there. A change you make to a literal value
-(say, `LOG_LEVEL`) makes the entry a conflict, and agentctl won't revert it.
-
+------------------------------------------------------------------------
 ## Commands
-
-```
-inventory     Discover assets across local files and connected accounts
-list          List assets in the authoritative store
-show          Show an asset's source, dependencies, and target support
-import        Copy assets into the store; preserve originals
-diff          Compare canonical, source, and deployed copies
-edit          Open canonical source in $EDITOR
-deploy        Link, install, or package assets for selected targets
-status        Show missing, outdated, conflicting, or unsupported assets
-update        Preview or apply upstream updates to imported assets
-remove        Remove an asset from the store or a target
-doctor        Check discovery, paths, packages, and dependencies
-target        Inspect and configure agent targets
-config        Inspect and configure agentctl
-help          Show command help
+```text
+agentctl list [-v|--verbose]
+agentctl status [codex|claude-code] [-v|--verbose]
+agentctl diff [TARGET NAME]
+agentctl pull TARGET NAME [--replace] [--dry-run]
+agentctl deploy TARGET [NAME] [--copy] [--replace] [--dry-run]
+agentctl export TARGET [NAME]
+agentctl help
+agentctl version
 ```
 
-Every command accepts `--json` (structured output) and `--quiet`. `agentctl help
-COMMAND` lists each command's options. Selection options (`--kind`, `--target`,
-`--all-targets`, `--origin`, `--scope`, `--project`, `--exclude`) apply where they
-make sense.
+`NAME` is `agents.md` (alias `instructions`) or a skill name. `TARGET` is
+`codex` or `claude-code` for local commands. Export targets are `claude-chat`
+and `chatgpt`.
 
-### Import sources
+`list` prints aligned instruction and skill types and names. `status` groups
+by kind, item, and agent. Every instruction file is shown; only the
+`agents.md` entrypoint has agent details. Other instruction files are
+informational, and their references are not analyzed. `-v` or `--verbose`
+shows canonical paths and, for `status`, the applicable live paths.
 
+`status` reports `direct`, `pointer`, `linked`, `same copy`, `different`,
+`new`, or `missing`. Bare `diff` shows all local drift, including new and
+missing assets as additions and deletions. `diff TARGET NAME` selects one
+comparison. Generated directories such as `.venv/`, `__pycache__/`, and
+`node_modules/` are ignored for comparison and portable copies.
+
+`pull` copies a selected live asset into the store. `deploy` uses the store
+directly where supported, writes an instruction pointer, or links a skill.
+`--copy` requests a copy. Neither command replaces divergent content without
+`--replace`, which saves a complete backup under
+`~/.local/state/agentctl/backups/` first. Neither command moves its source.
+`--dry-run` previews actions and conflicts without writing or creating
+backups. Conflicts return a nonzero exit code. Bulk deployment checks every
+selected asset for conflicts before making changes.
+
+Codex uses `~/.agents/skills/` directly when that is the store. Existing
+`~/.codex/AGENTS.md` and `~/.claude/CLAUDE.md` files that contain only
+`Follow instructions at ~/.agents/instructions/agents.md now.` are recognized
+as pointers. Claude Code skills use links by default. A separately
+installed Codex skill under `~/.codex/skills/` is still inspected for drift.
+Set `AGENTCTL_STORE`, `CODEX_HOME`, or `CLAUDE_CONFIG_DIR` to override paths.
+
+`export` writes the complete instruction directory and skill ZIPs to
+`~/.local/state/agentctl/exports/TARGET/` for manual account installation.
+The CLI cannot read ChatGPT or Claude chat account versions, so it cannot
+report their drift or confirm an upload. Referenced instruction files must
+be adapted to each account's instruction format. Re-export and upload after
+a store change. Account skill support and upload steps depend on the account.
+
+------------------------------------------------------------------------
+## Build and test
+Requires Go 1.24.7 or later. The CLI itself uses only the Go standard
+library. `git` is required for `diff` and release tasks.
 ```sh
-agentctl import ~/.claude/skills/example               # a directory
-agentctl import ~/Downloads/morning-brief.zip          # a ZIP (e.g. downloaded from claude.ai)
-agentctl import 3fa2c1d0                               # an inventory ID
-agentctl import prune-prose --from claude-code         # by name from a target
-agentctl import https://github.com/org/repo --all --kind skills
-agentctl import https://github.com/org/repo/tree/main/skills/pdf
-agentctl import https://github.com/org/repo#skills/pdf --version v1.2.0
-agentctl import ./.mcp.json --all                      # every MCP server in a file
-```
-
-Import skips symlinks that point outside the asset and warns about them, and
-packages never include content from outside the asset. A directory of
-executables without a `tool.json` imports as a script tool.
-
-Each import records the source, the version or git revision, the license
-(from frontmatter, `plugin.json`, or a LICENSE file), and content hashes.
-`--on-conflict fail|skip|rename` controls name collisions. The default, `fail`,
-imports nothing when any name collides. A skill that came from inside a plugin
-records the plugin as a dependency, and it stays `blocked` on a target until
-that plugin is in the store and assigned there too.
-
-### Deployment states
-
-| State      | Meaning |
-|------------|---------|
-| `ok`       | deployed and current, verified or acknowledged |
-| `missing`  | assigned but not deployed |
-| `outdated` | agentctl deployed it, and the store has changed since |
-| `conflict` | the destination holds something agentctl didn't deploy, or its deployed copy was edited |
-| `blocked`  | the target can't take it, or a dependency is missing |
-| `manual`   | waiting for an upload or command, then `target acknowledge` |
-
-### Updates
-
-`agentctl update` compares each imported asset with its upstream: a path, ZIP,
-repository, or the target it was imported from (plugin caches included).
-`--check` compares git revisions without cloning. `--apply` does a file-level
-three-way merge. Upstream changes to files you haven't touched are applied, your
-local additions and edits are kept, and if you and upstream changed the same
-file, it stops before changing anything.
-
-### Ownership
-
-agentctl only replaces or removes what its records show it deployed, and only
-while that is unchanged. These count as conflicts:
-
-- a destination another asset occupies
-- a symlink you pointed somewhere else
-- a deployed copy you edited
-- an unreadable directory
-- a directory holding `.git`
-
-An explicit `--method copy` is remembered on later deploys.
-`update --apply` edits the store in place, so a `.git` inside an asset survives.
-
-## Configuration
-
-```yaml
-# ~/.agents/agentctl.yaml
-editor: nvim
-bin-dir: ~/.local/bin
-exclude:
-  - ~/work/client-repo
-deploy:
-  method: auto          # auto | link | copy | package
-targets:
-  chatgpt:
-    enabled: false
-  claude-code:
-    assets:
-      - instructions/core
-      - skills/prune-prose
-  codex:
-    assets:
-      - instructions/core
-    paths:
-      skills: ~/.codex/skills
-projects:
-  ~/src/app:
-    targets:
-      claude-code:
-        assets:
-          - skills/app-conventions
-```
-
-Change it with `agentctl config set|get`, `agentctl config exclude
-add|remove|list`, and `agentctl target enable|disable|assign|unassign`, or edit it
-by hand. Project assignments (`target assign --project PATH`) deploy to the
-project's `.claude/skills`, `CLAUDE.md`, `AGENTS.md`, `.agents/skills`, and
-`.mcp.json`.
-
-## Exit status
-
-`0` success · `1` failure or refusal · `2` usage error · `3` a `--check` found work to do.
-
-## Boundaries
-
-- Source lives in `~/.agents/`. Vendor caches remain application-managed.
-- Credentials remain in each client's credential store.
-- Unsupported account operations produce explicit manual steps.
-- No automatic commits, pushes, or public publication.
-
-## Notes and limitations
-
-- Account inventories cannot be read completely. Claude's local cache supplies
-  partial, read-only skill and plugin snapshots; ChatGPT shows acknowledged
-  assets only. To import an account skill, export its source and import that file.
-- `inventory --target codex --include-cache` shows Codex-managed plugin and
-  skill copies as read-only evidence; cache presence does not prove enablement.
-- Codex and ChatGPT plugins require a portable `plugin.json` or
-  `.codex-plugin/plugin.json`; Claude Code and Claude Desktop plugins require
-  `.claude-plugin/plugin.json`. Keep both manifests in one canonical plugin when
-  deploying it across providers.
-- Codex reads skills from `~/.agents/skills`. With the default store, every
-  stored skill is visible to Codex whether assigned or not (`doctor` notes this).
-  To make Codex respect assignments, point `targets.codex.paths.skills` somewhere
-  else.
-- On Windows, `auto` deploys copies instead of symlinks.
-- Inside `remove`, `--store` means "remove from the store". To use a
-  non-default store with `remove`, set `$AGENTCTL_STORE`.
-- agentctl reads Codex's `config.toml` to verify MCP servers but never writes it.
-
-## Development
-
-```sh
-make help    # Makefile targets and options
-make test    # go test ./...
-make vet     # go vet + gofmt check
 make build
+make test
+make vet
+make help
 ```
+To put the binary on your path, run
+`go build -trimpath -o ~/bin/agentctl ./cmd/agentctl`.
 
+------------------------------------------------------------------------
+## Releases
+After a commit reaches `main`, run `make deploy patch`, `make deploy minor`,
+or `make deploy major`. The target waits for that commit's CI run, then
+creates and pushes an annotated SemVer tag. CI builds release archives and
+publishes a GitHub Release. `make dist` builds archives locally from the
+version tag checked out at `HEAD`. Release binaries are unsigned.
+
+------------------------------------------------------------------------
 ## License
-
 MIT. See [LICENSE](LICENSE).
