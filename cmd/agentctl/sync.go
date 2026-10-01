@@ -78,7 +78,7 @@ func (a app) help() {
 Usage:
   agentctl list [-v|--verbose]
   agentctl status [codex|claude-code] [-v|--verbose]
-  agentctl diff [TARGET NAME]
+  agentctl diff [TARGET NAME] [-v|--verbose]
   agentctl pull TARGET NAME [--replace] [--dry-run]
   agentctl deploy TARGET [NAME] [--copy] [--replace] [--dry-run]
   agentctl export TARGET [NAME]
@@ -96,7 +96,8 @@ store and requires --replace if the canonical version differs. No command
 moves a source. --dry-run previews actions without writing.
 
 list prints aligned types and names; status groups kind, item, and target.
--v/--verbose shows paths. Bare diff shows all local drift.
+-v/--verbose shows paths for list and status, and changed lines for diff.
+Bare diff shows changed files across all local drift.
 
 Environment: AGENTCTL_STORE, CODEX_HOME, CLAUDE_CONFIG_DIR, HOME.
 `)
@@ -432,11 +433,19 @@ func (a app) state(target, name string) (string, error) {
 
 // diff shows all local drift or a selected canonical/live comparison.
 func (a app) diff(args []string) error {
-	if len(args) == 2 {
-		return a.diffAsset(args[0], normalizeName(args[1]))
+	flags := flag.NewFlagSet("diff", flag.ContinueOnError)
+	flags.SetOutput(a.errout)
+	verbose := flags.Bool("verbose", false, "show changed lines")
+	flags.BoolVar(verbose, "v", false, "show changed lines")
+	positional, err := parseFlags(flags, args)
+	if err != nil {
+		return err
 	}
-	if len(args) != 0 {
-		return errors.New("usage: agentctl diff [TARGET NAME]")
+	if len(positional) == 2 {
+		return a.diffAsset(positional[0], normalizeName(positional[1]), *verbose)
+	}
+	if len(positional) != 0 {
+		return errors.New("usage: agentctl diff [TARGET NAME] [-v|--verbose]")
 	}
 	targets := []string{"codex", "claude-code"}
 	names, err := a.knownNames(targets)
@@ -474,7 +483,7 @@ func (a app) diff(args []string) error {
 				printed = true
 			}
 			fmt.Fprintf(a.out, "  %-11s %s\n", target, state)
-			if err := a.diffAsset(target, name); err != nil {
+			if err := a.diffAsset(target, name, *verbose); err != nil {
 				return err
 			}
 			found = true
@@ -487,7 +496,7 @@ func (a app) diff(args []string) error {
 }
 
 // diffAsset compares portable snapshots, treating an absent side as empty.
-func (a app) diffAsset(target, name string) error {
+func (a app) diffAsset(target, name string, verbose bool) error {
 	path, err := a.targetPath(target, name)
 	if err != nil {
 		return err
@@ -523,14 +532,37 @@ func (a app) diffAsset(target, name string) error {
 			return err
 		}
 	}
-	cmd := exec.Command("git", "diff", "--no-index", "--", "canonical", "live")
-	cmd.Dir = tmp
-	cmd.Stdout, cmd.Stderr = a.out, a.errout
-	err = cmd.Run()
-	if e, ok := err.(*exec.ExitError); ok && e.ExitCode() == 1 {
-		return nil
+	args := []string{"diff", "--no-index"}
+	if !verbose {
+		args = append(args, "--name-only")
 	}
-	return err
+	args = append(args, "--", "canonical", "live")
+	cmd := exec.Command("git", args...)
+	cmd.Dir = tmp
+	var output bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &output, a.errout
+	err = cmd.Run()
+	if err != nil {
+		if e, ok := err.(*exec.ExitError); !ok || e.ExitCode() != 1 {
+			return err
+		}
+	}
+	if verbose {
+		_, err = io.Copy(a.out, &output)
+		return err
+	}
+	for _, file := range strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n") {
+		if file == "" {
+			continue
+		}
+		if name == "instructions" {
+			file = "agents.md"
+		} else {
+			file = strings.TrimPrefix(strings.TrimPrefix(file, "canonical/"), "live/")
+		}
+		fmt.Fprintln(a.out, "    "+file)
+	}
+	return nil
 }
 
 // pull copies a live asset into the store, preserving a divergent canonical copy.

@@ -12,7 +12,7 @@ does not scan plugin caches, project directories, or the rest of the disk.
 ```text
 agentctl list [-v|--verbose]
 agentctl status [codex|claude-code] [-v|--verbose]
-agentctl diff [TARGET NAME]
+agentctl diff [TARGET NAME] [-v|--verbose]
 agentctl pull TARGET NAME [--replace] [--dry-run]
 agentctl deploy TARGET [NAME] [--copy] [--replace] [--dry-run]
 agentctl export TARGET [NAME]
@@ -32,9 +32,10 @@ shows canonical paths and, for `status`, the applicable live paths.
 
 `status` reports `direct`, `pointer`, `linked`, `same copy`, `different`,
 `new`, or `missing`. Bare `diff` shows all local drift, including new and
-missing assets as additions and deletions. `diff TARGET NAME` selects one
-comparison. Generated directories such as `.venv/`, `__pycache__/`, and
-`node_modules/` are ignored for comparison and portable copies.
+missing assets, as file names. `diff TARGET NAME` selects one comparison.
+Use `-v` or `--verbose` with `diff` to show changed lines. Generated
+directories such as `.venv/`, `__pycache__/`, and `node_modules/` are ignored
+for comparison and portable copies.
 
 `pull` copies a selected live asset into the store. `deploy` uses the store
 directly where supported, writes an instruction pointer, or links a skill.

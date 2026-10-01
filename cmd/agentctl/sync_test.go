@@ -217,8 +217,12 @@ func TestGeneratedFilesIgnored(t *testing.T) {
 	}
 	writeFixture(t, filepath.Join(home, ".claude/skills/example/SKILL.md"), "live change")
 	out, stderr, code = run("diff", "claude-code", "example")
+	if code != 0 || strings.TrimSpace(out) != "SKILL.md" {
+		t.Fatalf("missing file diff: %s %s", out, stderr)
+	}
+	out, stderr, code = run("diff", "claude-code", "example", "--verbose")
 	if code != 0 || !strings.Contains(out, "+live change") {
-		t.Fatalf("missing content diff: %s %s", out, stderr)
+		t.Fatalf("missing verbose content diff: %s %s", out, stderr)
 	}
 	writeFixture(t, filepath.Join(home, ".claude/skills/example/SKILL.md"), "skill")
 	out, stderr, code = run("deploy", "claude-code", "example")
@@ -288,12 +292,22 @@ func TestBareDiff(t *testing.T) {
 	home, run := fixture(t)
 	writeFixture(t, filepath.Join(home, ".agents/skills/changed/SKILL.md"), "canonical content\n")
 	writeFixture(t, filepath.Join(home, ".claude/skills/changed/SKILL.md"), "changed content\n")
+	writeFixture(t, filepath.Join(home, ".claude/skills/changed/scripts/helper.sh"), "new helper\n")
 	writeFixture(t, filepath.Join(home, ".claude/skills/new/SKILL.md"), "new content\n")
 	writeFixture(t, filepath.Join(home, ".agents/skills/missing/SKILL.md"), "missing content\n")
 	out, stderr, code := run("diff")
-	for _, expected := range []string{"Skills:", "changed\n  claude-code different", "+changed content", "new\n  claude-code new", "+new content", "missing\n  claude-code missing", "-missing content"} {
+	for _, expected := range []string{"Skills:", "changed\n  claude-code different", "    SKILL.md", "    scripts/helper.sh", "new\n  claude-code new", "missing\n  claude-code missing"} {
 		if code != 0 || !strings.Contains(out, expected) {
 			t.Fatalf("missing %q: %s %s", expected, out, stderr)
+		}
+	}
+	if strings.Contains(out, "content") || strings.Contains(out, "diff --git") {
+		t.Fatalf("default diff showed changed lines: %s", out)
+	}
+	out, stderr, code = run("diff", "-v")
+	for _, expected := range []string{"+changed content", "+new content", "-missing content"} {
+		if code != 0 || !strings.Contains(out, expected) {
+			t.Fatalf("verbose diff missing %q: %s %s", expected, out, stderr)
 		}
 	}
 }
@@ -306,9 +320,13 @@ func TestDiffEntrypointAlias(t *testing.T) {
 	writeFixture(t, filepath.Join(home, ".codex/AGENTS.md"), "live rules\n")
 	for _, args := range [][]string{{"diff"}, {"diff", "codex", "agents.md"}, {"diff", "codex", "instructions"}} {
 		out, stderr, code := run(args...)
-		if code != 0 || !strings.Contains(out, "+live rules") || strings.Contains(out, "informational only") {
+		if code != 0 || !strings.Contains(out, "agents.md") || strings.Contains(out, "informational only") || strings.Contains(out, "+live rules") {
 			t.Fatalf("diff: %s %s", out, stderr)
 		}
+	}
+	out, stderr, code := run("diff", "codex", "instructions", "-v")
+	if code != 0 || !strings.Contains(out, "+live rules") || strings.Contains(out, "informational only") {
+		t.Fatalf("verbose diff: %s %s", out, stderr)
 	}
 }
 
