@@ -56,6 +56,10 @@ func TestStatusDiscoversOnlyKnownPaths(t *testing.T) {
 	if strings.Contains(out, "noise") {
 		t.Errorf("plugin cache appeared: %s", out)
 	}
+	out, stderr, code = run("status", "kept", "codex")
+	if code != 0 || !strings.Contains(out, "kept\n  codex       different") || strings.Contains(out, "claude-code") || strings.Contains(out, "new") {
+		t.Fatalf("selected status: %s %s", out, stderr)
+	}
 }
 
 // TestDeployAndPull verifies link preference, conflict protection, and backups.
@@ -64,7 +68,7 @@ func TestDeployAndPull(t *testing.T) {
 	canonical := filepath.Join(home, ".agents/skills/example/SKILL.md")
 	live := filepath.Join(home, ".claude/skills/example/SKILL.md")
 	writeFixture(t, canonical, "original")
-	_, stderr, code := run("deploy", "claude-code", "example")
+	_, stderr, code := run("deploy", "example", "claude-code")
 	if code != 0 {
 		t.Fatal(stderr)
 	}
@@ -80,15 +84,15 @@ func TestDeployAndPull(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFixture(t, live, "live change")
-	_, stderr, code = run("deploy", "claude-code", "example")
+	_, stderr, code = run("deploy", "example", "claude-code")
 	if code == 0 || !strings.Contains(stderr, "differs") {
 		t.Fatalf("expected conflict: %s", stderr)
 	}
-	_, stderr, code = run("pull", "claude-code", "example")
+	_, stderr, code = run("pull", "example", "claude-code")
 	if code == 0 || !strings.Contains(stderr, "--replace") {
 		t.Fatalf("expected pull conflict: %s", stderr)
 	}
-	out, stderr, code = run("pull", "claude-code", "example", "--replace")
+	out, stderr, code = run("pull", "example", "claude-code", "--replace")
 	if code != 0 {
 		t.Fatal(stderr)
 	}
@@ -104,17 +108,39 @@ func TestDeployAndPull(t *testing.T) {
 	}
 }
 
+// TestDeployNameDefaultsToAllLocalTargets verifies asset-first global deployment.
+func TestDeployNameDefaultsToAllLocalTargets(t *testing.T) {
+	home, run := fixture(t)
+	writeFixture(t, filepath.Join(home, ".agents/skills/example/SKILL.md"), "skill")
+	out, stderr, code := run("deploy", "example", "--dry-run")
+	if code != 0 || !strings.Contains(out, "codex/example: direct") || !strings.Contains(out, "would link ~/.agents/skills/example -> ~/.claude/skills/example") {
+		t.Fatalf("global deploy preview: %s %s", out, stderr)
+	}
+	_, stderr, code = run("deploy", "example")
+	if code != 0 {
+		t.Fatal(stderr)
+	}
+	info, err := os.Lstat(filepath.Join(home, ".claude/skills/example"))
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("global deploy missed Claude: %v", err)
+	}
+	out, stderr, code = run("deploy", "--target=claude-code", "--dry-run")
+	if code != 0 || strings.Contains(out, "codex/") || !strings.Contains(out, "claude-code/example") {
+		t.Fatalf("targeted bulk preview: %s %s", out, stderr)
+	}
+}
+
 // TestDeployCopyAndDirectInstructions checks copy mode and existing pointers.
 func TestDeployCopyAndDirectInstructions(t *testing.T) {
 	home, run := fixture(t)
 	writeFixture(t, filepath.Join(home, ".agents/instructions/agents.md"), "rules")
 	writeFixture(t, filepath.Join(home, ".claude/CLAUDE.md"), "Follow instructions at ~/.agents/instructions/agents.md now.\n")
 	writeFixture(t, filepath.Join(home, ".agents/skills/example/SKILL.md"), "original")
-	out, stderr, code := run("deploy", "claude-code", "--copy")
+	out, stderr, code := run("deploy", "--copy")
 	if code != 0 {
 		t.Fatal(stderr)
 	}
-	if !strings.Contains(out, "instructions: pointer") {
+	if !strings.Contains(out, "claude-code/instructions: pointer") {
 		t.Fatal(out)
 	}
 	path := filepath.Join(home, ".claude/skills/example")
@@ -133,7 +159,7 @@ func TestDeployCopyAndDirectInstructions(t *testing.T) {
 func TestDeployInstructionPointer(t *testing.T) {
 	home, run := fixture(t)
 	writeFixture(t, filepath.Join(home, ".agents/instructions/agents.md"), "Follow general.md")
-	out, stderr, code := run("deploy", "claude-code", "instructions")
+	out, stderr, code := run("deploy", "instructions", "claude-code")
 	if code != 0 || !strings.Contains(out, "points to") {
 		t.Fatalf("deploy: %s %s", out, stderr)
 	}
@@ -147,13 +173,103 @@ func TestDeployInstructionPointer(t *testing.T) {
 	}
 }
 
+// TestAdoptCopiesNewSkillAndDeploysOthers verifies the one-command local workflow.
+func TestAdoptCopiesNewSkillAndDeploysOthers(t *testing.T) {
+	home, run := fixture(t)
+	live := filepath.Join(home, ".claude/skills/example/SKILL.md")
+	writeFixture(t, live, "new skill")
+	before, err := fingerprint(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, stderr, code := run("adopt", "example", "--dry-run")
+	if code != 0 || !strings.Contains(out, "would copy") || !strings.Contains(out, "codex: would use the store directly") {
+		t.Fatalf("adopt preview: %s %s", out, stderr)
+	}
+	after, err := fingerprint(home)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("adopt preview changed files: %v", err)
+	}
+	out, stderr, code = run("adopt", "example")
+	if code != 0 || !strings.Contains(out, "pulled example from claude-code") {
+		t.Fatalf("adopt: %s %s", out, stderr)
+	}
+	if string(mustRead(t, filepath.Join(home, ".agents/skills/example/SKILL.md"))) != "new skill" || string(mustRead(t, live)) != "new skill" {
+		t.Fatal("adopt did not preserve source and create canonical skill")
+	}
+	out, stderr, code = run("status")
+	if code != 0 || !strings.Contains(out, "codex       direct") || !strings.Contains(out, "claude-code same copy") {
+		t.Fatalf("adopt status: %s %s", out, stderr)
+	}
+}
+
+// TestAdoptPreflightsOtherTarget prevents a partial pull on destination conflict.
+func TestAdoptPreflightsOtherTarget(t *testing.T) {
+	home, run := fixture(t)
+	writeFixture(t, filepath.Join(home, ".claude/skills/example/SKILL.md"), "claude")
+	writeFixture(t, filepath.Join(home, ".codex/skills/example/SKILL.md"), "codex")
+	_, stderr, code := run("adopt", "example")
+	if code == 0 || !strings.Contains(stderr, "multiple local sources") {
+		t.Fatalf("expected source ambiguity: %s", stderr)
+	}
+	_, stderr, code = run("adopt", "example", "claude-code")
+	if code == 0 || !strings.Contains(stderr, "differs") || exists(filepath.Join(home, ".agents/skills/example")) {
+		t.Fatalf("expected preflight conflict: %s", stderr)
+	}
+	out, stderr, code := run("adopt", "example", "claude-code", "--replace", "--dry-run")
+	if code != 0 || !strings.Contains(out, "would backup") || exists(filepath.Join(home, ".agents/skills/example")) {
+		t.Fatalf("adopt replacement preview: %s %s", out, stderr)
+	}
+	out, stderr, code = run("adopt", "example", "claude-code", "--replace")
+	if code != 0 || !strings.Contains(out, "backup:") || string(mustRead(t, filepath.Join(home, ".agents/skills/example/SKILL.md"))) != "claude" {
+		t.Fatalf("adopt replacement: %s %s", out, stderr)
+	}
+	backups, err := filepath.Glob(filepath.Join(home, ".local/state/agentctl/backups/*/example/SKILL.md"))
+	if err != nil || len(backups) != 1 || string(mustRead(t, backups[0])) != "codex" {
+		t.Fatalf("adopt backup: %v %v", backups, err)
+	}
+}
+
+// TestAdoptFromCodexDeploysClaude verifies the other source direction.
+func TestAdoptFromCodexDeploysClaude(t *testing.T) {
+	home, run := fixture(t)
+	writeFixture(t, filepath.Join(home, ".codex/skills/example/SKILL.md"), "codex skill")
+	out, stderr, code := run("adopt", "example")
+	if code != 0 || !strings.Contains(out, "pulled example from codex") {
+		t.Fatalf("adopt: %s %s", out, stderr)
+	}
+	if string(mustRead(t, filepath.Join(home, ".agents/skills/example/SKILL.md"))) != "codex skill" {
+		t.Fatal("missing canonical skill")
+	}
+	info, err := os.Lstat(filepath.Join(home, ".claude/skills/example"))
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("Claude skill was not linked: %v", err)
+	}
+}
+
+// TestAdoptInstructions creates the central entrypoint and other agent pointer.
+func TestAdoptInstructions(t *testing.T) {
+	home, run := fixture(t)
+	writeFixture(t, filepath.Join(home, ".codex/AGENTS.md"), "new rules")
+	out, stderr, code := run("adopt", "agents.md")
+	if code != 0 || !strings.Contains(out, "pulled instructions from codex") {
+		t.Fatalf("adopt instructions: %s %s", out, stderr)
+	}
+	if string(mustRead(t, filepath.Join(home, ".agents/instructions/agents.md"))) != "new rules" {
+		t.Fatal("missing central instructions")
+	}
+	if string(mustRead(t, filepath.Join(home, ".claude/CLAUDE.md"))) != "Follow instructions at ~/.agents/instructions/agents.md now.\n" {
+		t.Fatal("missing Claude instruction pointer")
+	}
+}
+
 // TestExportAndValidation verifies account package contents and path boundaries.
 func TestExportAndValidation(t *testing.T) {
 	home, run := fixture(t)
 	writeFixture(t, filepath.Join(home, ".agents/instructions/agents.md"), "rules")
 	writeFixture(t, filepath.Join(home, ".agents/instructions/coding.md"), "coding rules")
 	writeFixture(t, filepath.Join(home, ".agents/skills/example/SKILL.md"), "skill")
-	out, stderr, code := run("export", "claude-chat")
+	out, stderr, code := run("export")
 	if code != 0 {
 		t.Fatal(stderr)
 	}
@@ -172,7 +288,14 @@ func TestExportAndValidation(t *testing.T) {
 	if string(mustRead(t, filepath.Join(home, ".local/state/agentctl/exports/claude-chat/instructions/agents.md"))) != "rules" || string(mustRead(t, filepath.Join(home, ".local/state/agentctl/exports/claude-chat/instructions/coding.md"))) != "coding rules" {
 		t.Fatal("instruction export")
 	}
-	_, stderr, code = run("pull", "claude-code", "../escape")
+	if !exists(filepath.Join(home, ".local/state/agentctl/exports/chatgpt/example.zip")) {
+		t.Fatal("default export missed chatgpt")
+	}
+	out, stderr, code = run("export", "example", "chatgpt")
+	if code != 0 || !strings.Contains(out, "chatgpt/example.zip") || strings.Contains(out, "claude-chat") {
+		t.Fatalf("selected export: %s %s", out, stderr)
+	}
+	_, stderr, code = run("pull", "../escape", "claude-code")
 	if code == 0 || !strings.Contains(stderr, "invalid asset name") {
 		t.Fatal(stderr)
 	}
@@ -190,7 +313,7 @@ func TestPullLinkedExternalSkill(t *testing.T) {
 	if err := os.Symlink(external, live); err != nil {
 		t.Fatal(err)
 	}
-	_, stderr, code := run("pull", "claude-code", "example")
+	_, stderr, code := run("pull", "example", "claude-code")
 	if code != 0 {
 		t.Fatal(stderr)
 	}
@@ -211,21 +334,21 @@ func TestGeneratedFilesIgnored(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "same copy") {
 		t.Fatalf("status: %s %s", out, stderr)
 	}
-	out, stderr, code = run("diff", "claude-code", "example")
-	if code != 0 || out != "" {
+	out, stderr, code = run("diff", "example", "claude-code")
+	if code != 0 || !strings.Contains(out, "claude-code same copy") || strings.Contains(out, "runtime") || strings.Contains(out, "cache") {
 		t.Fatalf("generated files appeared in diff: %s %s", out, stderr)
 	}
 	writeFixture(t, filepath.Join(home, ".claude/skills/example/SKILL.md"), "live change")
-	out, stderr, code = run("diff", "claude-code", "example")
-	if code != 0 || strings.TrimSpace(out) != "SKILL.md" {
+	out, stderr, code = run("diff", "example", "claude-code")
+	if code != 0 || !strings.Contains(out, "claude-code different\n    SKILL.md") || strings.Contains(out, "live change") {
 		t.Fatalf("missing file diff: %s %s", out, stderr)
 	}
-	out, stderr, code = run("diff", "claude-code", "example", "--verbose")
+	out, stderr, code = run("diff", "example", "claude-code", "--verbose")
 	if code != 0 || !strings.Contains(out, "+live change") {
 		t.Fatalf("missing verbose content diff: %s %s", out, stderr)
 	}
 	writeFixture(t, filepath.Join(home, ".claude/skills/example/SKILL.md"), "skill")
-	out, stderr, code = run("deploy", "claude-code", "example")
+	out, stderr, code = run("deploy", "example", "claude-code")
 	if code != 0 || !strings.Contains(out, "backup:") {
 		t.Fatalf("deploy: %s %s", out, stderr)
 	}
@@ -291,17 +414,23 @@ func TestInventoryOutput(t *testing.T) {
 func TestBareDiff(t *testing.T) {
 	home, run := fixture(t)
 	writeFixture(t, filepath.Join(home, ".agents/skills/changed/SKILL.md"), "canonical content\n")
+	writeFixture(t, filepath.Join(home, ".agents/skills/changed/references/removed.md"), "removed\n")
 	writeFixture(t, filepath.Join(home, ".claude/skills/changed/SKILL.md"), "changed content\n")
 	writeFixture(t, filepath.Join(home, ".claude/skills/changed/scripts/helper.sh"), "new helper\n")
 	writeFixture(t, filepath.Join(home, ".claude/skills/new/SKILL.md"), "new content\n")
 	writeFixture(t, filepath.Join(home, ".agents/skills/missing/SKILL.md"), "missing content\n")
 	out, stderr, code := run("diff")
-	for _, expected := range []string{"Skills:", "changed\n  claude-code different", "    SKILL.md", "    scripts/helper.sh", "new\n  claude-code new", "missing\n  claude-code missing"} {
+	for _, expected := range []string{
+		"Skills:",
+		"changed\n  claude-code different\n    SKILL.md\n    references/removed.md\n    scripts/helper.sh",
+		"new\n  claude-code new (files in claude-code)\n    SKILL.md",
+		"missing\n  claude-code missing (files in store)\n    SKILL.md",
+	} {
 		if code != 0 || !strings.Contains(out, expected) {
 			t.Fatalf("missing %q: %s %s", expected, out, stderr)
 		}
 	}
-	if strings.Contains(out, "content") || strings.Contains(out, "diff --git") {
+	if strings.Contains(out, "/dev/null") || strings.Contains(out, "content") || strings.Contains(out, "diff --git") {
 		t.Fatalf("default diff showed changed lines: %s", out)
 	}
 	out, stderr, code = run("diff", "-v")
@@ -318,13 +447,13 @@ func TestDiffEntrypointAlias(t *testing.T) {
 	writeFixture(t, filepath.Join(home, ".agents/instructions/agents.md"), "canonical rules\n")
 	writeFixture(t, filepath.Join(home, ".agents/instructions/coding.md"), "informational only\n")
 	writeFixture(t, filepath.Join(home, ".codex/AGENTS.md"), "live rules\n")
-	for _, args := range [][]string{{"diff"}, {"diff", "codex", "agents.md"}, {"diff", "codex", "instructions"}} {
+	for _, args := range [][]string{{"diff"}, {"diff", "agents.md", "codex"}, {"diff", "instructions", "codex"}} {
 		out, stderr, code := run(args...)
 		if code != 0 || !strings.Contains(out, "agents.md") || strings.Contains(out, "informational only") || strings.Contains(out, "+live rules") {
 			t.Fatalf("diff: %s %s", out, stderr)
 		}
 	}
-	out, stderr, code := run("diff", "codex", "instructions", "-v")
+	out, stderr, code := run("diff", "instructions", "codex", "-v")
 	if code != 0 || !strings.Contains(out, "+live rules") || strings.Contains(out, "informational only") {
 		t.Fatalf("verbose diff: %s %s", out, stderr)
 	}
@@ -346,12 +475,12 @@ func TestDryRunsDoNotWrite(t *testing.T) {
 		wants []string
 		code  int
 	}{
-		{[]string{"deploy", "claude-code", "--dry-run"}, []string{"would pointer", "conflict:"}, 1},
-		{[]string{"deploy", "claude-code", "--dry-run", "--replace"}, []string{"would pointer", "would backup", "would link"}, 0},
-		{[]string{"deploy", "claude-code", "--copy", "--dry-run", "--replace"}, []string{"would copy", "would backup"}, 0},
-		{[]string{"pull", "claude-code", "example", "--dry-run"}, []string{}, 1},
-		{[]string{"pull", "claude-code", "example", "--replace", "--dry-run"}, []string{"would backup", "would copy"}, 0},
-		{[]string{"pull", "--dry-run", "claude-code", "new"}, []string{"would copy"}, 0},
+		{[]string{"deploy", "--dry-run"}, []string{"would pointer", "conflict:"}, 1},
+		{[]string{"deploy", "--dry-run", "--replace"}, []string{"would pointer", "would backup", "would link"}, 0},
+		{[]string{"deploy", "--copy", "--dry-run", "--replace"}, []string{"would copy", "would backup"}, 0},
+		{[]string{"pull", "example", "claude-code", "--dry-run"}, []string{}, 1},
+		{[]string{"pull", "example", "claude-code", "--replace", "--dry-run"}, []string{"would backup", "would copy"}, 0},
+		{[]string{"pull", "--dry-run", "new"}, []string{"would copy"}, 0},
 	}
 	for _, c := range cases {
 		out, stderr, code := run(c.args...)
@@ -374,8 +503,8 @@ func TestDryRunsDoNotWrite(t *testing.T) {
 			t.Fatalf("%v created paths", c.args)
 		}
 	}
-	_, _, code := run("deploy", "claude-code")
-	if code != 1 || exists(filepath.Join(home, ".claude/CLAUDE.md")) {
+	_, _, code := run("deploy")
+	if code != 1 || exists(filepath.Join(home, ".claude/CLAUDE.md")) || exists(filepath.Join(home, ".codex/AGENTS.md")) {
 		t.Fatal("bulk conflict caused partial deployment")
 	}
 }
@@ -384,7 +513,7 @@ func TestDryRunsDoNotWrite(t *testing.T) {
 func TestBareDiffWithoutDrift(t *testing.T) {
 	home, run := fixture(t)
 	writeFixture(t, filepath.Join(home, ".agents/skills/example/SKILL.md"), "skill")
-	if _, stderr, code := run("deploy", "claude-code", "example"); code != 0 {
+	if _, stderr, code := run("deploy", "example", "claude-code"); code != 0 {
 		t.Fatal(stderr)
 	}
 	out, stderr, code := run("diff")

@@ -57,6 +57,8 @@ func execute(version string, args []string, out, errout io.Writer) int {
 		err = a.diff(args[1:])
 	case "pull":
 		err = a.pull(args[1:])
+	case "adopt":
+		err = a.adopt(args[1:])
 	case "deploy":
 		err = a.deploy(args[1:])
 	case "export":
@@ -77,23 +79,27 @@ func (a app) help() {
 
 Usage:
   agentctl list [-v|--verbose]
-  agentctl status [codex|claude-code] [-v|--verbose]
-  agentctl diff [TARGET NAME] [-v|--verbose]
-  agentctl pull TARGET NAME [--replace] [--dry-run]
-  agentctl deploy TARGET [NAME] [--copy] [--replace] [--dry-run]
-  agentctl export TARGET [NAME]
+  agentctl status [NAME [TARGET]] [-v|--verbose]
+  agentctl diff [NAME [TARGET]] [-v|--verbose]
+  agentctl pull NAME [SOURCE] [--replace] [--dry-run]
+  agentctl adopt NAME [SOURCE] [--replace] [--dry-run]
+  agentctl deploy [NAME [TARGET]] [--target=TARGET] [--copy] [--replace] [--dry-run]
+  agentctl export [NAME [TARGET]] [--target=TARGET]
   agentctl version
 
 NAME is "agents.md" (alias "instructions") or a skill directory name.
 TARGET is codex or claude-code for local commands; claude-chat or chatgpt
-for export. Omit NAME to deploy the entrypoint and skills, or export the store.
+for export. Deploy defaults to both local targets; export defaults to both
+account targets. Pull and adopt infer SOURCE when only one local agent has the
+asset. Omit NAME to deploy the entrypoint and all skills, or to export the store.
 
 The store is ~/.agents/{instructions,skills}/.
 Codex reads skills there directly. Instructions use a pointer; other local
 skills use links by default. --copy writes copies instead. --replace backs up
 divergent destinations before changing them. Pull copies a live asset into the
-store and requires --replace if the canonical version differs. No command
-moves a source. --dry-run previews actions without writing.
+store; adopt then deploys it to the other local agent. Pull requires --replace
+if the canonical version differs. No command moves a source. --dry-run previews
+actions without writing.
 
 list prints aligned types and names; status groups kind, item, and target.
 -v/--verbose shows paths for list and status, and changed lines for diff.
@@ -316,12 +322,38 @@ func (a app) status(args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(positional) > 1 {
-		return errors.New("usage: agentctl status [codex|claude-code] [-v|--verbose]")
+	if len(positional) > 2 {
+		return errors.New("usage: agentctl status [NAME [TARGET]] [-v|--verbose]")
 	}
 	targets := []string{"codex", "claude-code"}
+	selected := ""
 	if len(positional) == 1 {
-		targets = positional
+		if positional[0] == "codex" || positional[0] == "claude-code" {
+			targets = positional
+		} else {
+			selected = normalizeName(positional[0])
+		}
+	} else if len(positional) == 2 {
+		selected = normalizeName(positional[0])
+		targets = positional[1:]
+	}
+	if selected != "" {
+		if _, err := a.targetPath(targets[0], selected); err != nil {
+			return err
+		}
+		label := selected
+		if *verbose {
+			label = a.displayPath(a.source(selected))
+		}
+		if selected == "instructions" {
+			if !*verbose {
+				label = "agents.md"
+			}
+			fmt.Fprintf(a.out, "Instructions:\n%s\n", label)
+		} else {
+			fmt.Fprintf(a.out, "Skills:\n%s\n", label)
+		}
+		return a.statusTargets(targets, selected, *verbose)
 	}
 	names, err := a.knownNames(targets)
 	if err != nil {
@@ -442,12 +474,15 @@ func (a app) diff(args []string) error {
 		return err
 	}
 	if len(positional) == 2 {
-		return a.diffAsset(positional[0], normalizeName(positional[1]), *verbose)
+		return a.diffName(normalizeName(positional[0]), positional[1:], *verbose)
 	}
-	if len(positional) != 0 {
-		return errors.New("usage: agentctl diff [TARGET NAME] [-v|--verbose]")
+	if len(positional) > 2 {
+		return errors.New("usage: agentctl diff [NAME [TARGET]] [-v|--verbose]")
 	}
 	targets := []string{"codex", "claude-code"}
+	if len(positional) == 1 {
+		return a.diffName(normalizeName(positional[0]), targets, *verbose)
+	}
 	names, err := a.knownNames(targets)
 	if err != nil {
 		return err
@@ -482,7 +517,7 @@ func (a app) diff(args []string) error {
 				fmt.Fprintln(a.out, item)
 				printed = true
 			}
-			fmt.Fprintf(a.out, "  %-11s %s\n", target, state)
+			fmt.Fprintf(a.out, "  %-11s %s\n", target, diffStateLabel(state, target))
 			if err := a.diffAsset(target, name, *verbose); err != nil {
 				return err
 			}
@@ -493,6 +528,40 @@ func (a app) diff(args []string) error {
 		fmt.Fprintln(a.out, "No differences.")
 	}
 	return nil
+}
+
+// diffName shows one asset's state and changed files for selected local targets.
+func (a app) diffName(name string, targets []string, verbose bool) error {
+	if name == "instructions" {
+		fmt.Fprintln(a.out, "Instructions:\nagents.md")
+	} else {
+		fmt.Fprintf(a.out, "Skills:\n%s\n", name)
+	}
+	for _, target := range targets {
+		state, err := a.state(target, name)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(a.out, "  %-11s %s\n", target, diffStateLabel(state, target))
+		if state == "different" || state == "new" || state == "missing" {
+			if err := a.diffAsset(target, name, verbose); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// diffStateLabel identifies which side supplies one-sided file names.
+func diffStateLabel(state, target string) string {
+	switch state {
+	case "missing":
+		return state + " (files in store)"
+	case "new":
+		return state + " (files in " + target + ")"
+	default:
+		return state
+	}
 }
 
 // diffAsset compares portable snapshots, treating an absent side as empty.
@@ -532,44 +601,72 @@ func (a app) diffAsset(target, name string, verbose bool) error {
 			return err
 		}
 	}
-	args := []string{"diff", "--no-index"}
 	if !verbose {
-		args = append(args, "--name-only")
+		if !directory {
+			equal, err := same(filepath.Join(tmp, "canonical"), filepath.Join(tmp, "live"))
+			if err != nil {
+				return err
+			}
+			if !equal {
+				fmt.Fprintln(a.out, "    agents.md")
+			}
+			return nil
+		}
+		files := map[string][2]string{}
+		for side, label := range []string{"canonical", "live"} {
+			root := filepath.Join(tmp, label)
+			err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+				if walkErr != nil {
+					return walkErr
+				}
+				if entry.IsDir() {
+					return nil
+				}
+				rel, err := filepath.Rel(root, path)
+				if err != nil {
+					return err
+				}
+				pair := files[rel]
+				pair[side] = path
+				files[rel] = pair
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+		names := make([]string, 0, len(files))
+		for file := range files {
+			names = append(names, file)
+		}
+		sort.Strings(names)
+		for _, file := range names {
+			pair := files[file]
+			if pair[0] != "" && pair[1] != "" {
+				equal, err := same(pair[0], pair[1])
+				if err != nil {
+					return err
+				}
+				if equal {
+					continue
+				}
+			}
+			fmt.Fprintln(a.out, "    "+filepath.ToSlash(file))
+		}
+		return nil
 	}
-	args = append(args, "--", "canonical", "live")
-	cmd := exec.Command("git", args...)
+	cmd := exec.Command("git", "diff", "--no-index", "--", "canonical", "live")
 	cmd.Dir = tmp
-	var output bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &output, a.errout
+	cmd.Stdout, cmd.Stderr = a.out, a.errout
 	err = cmd.Run()
-	if err != nil {
-		if e, ok := err.(*exec.ExitError); !ok || e.ExitCode() != 1 {
-			return err
-		}
+	if e, ok := err.(*exec.ExitError); ok && e.ExitCode() == 1 {
+		return nil
 	}
-	if verbose {
-		_, err = io.Copy(a.out, &output)
-		return err
-	}
-	for _, file := range strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n") {
-		if file == "" {
-			continue
-		}
-		if name == "instructions" {
-			file = "agents.md"
-		} else {
-			file = strings.TrimPrefix(strings.TrimPrefix(file, "canonical/"), "live/")
-		}
-		fmt.Fprintln(a.out, "    "+file)
-	}
-	return nil
+	return err
 }
 
 // pull copies a live asset into the store, preserving a divergent canonical copy.
 func (a app) pull(args []string) error {
-	if len(args) < 2 {
-		return errors.New("usage: agentctl pull TARGET NAME [--replace] [--dry-run]")
-	}
 	flags := flag.NewFlagSet("pull", flag.ContinueOnError)
 	flags.SetOutput(a.errout)
 	replace := flags.Bool("replace", false, "back up and replace a different canonical asset")
@@ -578,20 +675,28 @@ func (a app) pull(args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(positional) != 2 {
-		return errors.New("usage: agentctl pull TARGET NAME [--replace] [--dry-run]")
+	if len(positional) < 1 || len(positional) > 2 {
+		return errors.New("usage: agentctl pull NAME [SOURCE] [--replace] [--dry-run]")
 	}
-	args = positional
-	args[1] = normalizeName(args[1])
-	path, err := a.targetPath(args[0], args[1])
+	name := normalizeName(positional[0])
+	source := ""
+	if len(positional) == 2 {
+		source = positional[1]
+	} else {
+		source, err = a.inferSource(name)
+		if err != nil {
+			return err
+		}
+	}
+	path, err := a.targetPath(source, name)
 	if err != nil {
 		return err
 	}
 	if !exists(path) {
 		return fmt.Errorf("live asset missing: %s", path)
 	}
-	src := a.source(args[1])
-	if linked(path, src) || args[1] == "instructions" && pointerTo(path, src) {
+	src := a.source(name)
+	if linked(path, src) || name == "instructions" && pointerTo(path, src) {
 		return errors.New("live asset already uses the store")
 	}
 	if exists(src) {
@@ -619,12 +724,115 @@ func (a app) pull(args []string) error {
 	if err := replaceWithCopy(path, src); err != nil {
 		return err
 	}
-	fmt.Fprintf(a.out, "pulled %s from %s\n", args[1], args[0])
+	fmt.Fprintf(a.out, "pulled %s from %s\n", name, source)
 	return nil
 }
 
+// inferSource accepts an omitted source only when one local asset exists.
+func (a app) inferSource(name string) (string, error) {
+	sources := []string{}
+	for _, target := range []string{"codex", "claude-code"} {
+		path, err := a.targetPath(target, name)
+		if err != nil {
+			return "", err
+		}
+		if exists(path) {
+			sources = append(sources, target)
+		}
+	}
+	if len(sources) == 1 {
+		return sources[0], nil
+	}
+	if len(sources) == 0 {
+		return "", fmt.Errorf("no local source for %s", name)
+	}
+	return "", fmt.Errorf("multiple local sources for %s; specify codex or claude-code", name)
+}
+
+// adopt adds a new local asset to the store and makes it available to the other agent.
+func (a app) adopt(args []string) error {
+	flags := flag.NewFlagSet("adopt", flag.ContinueOnError)
+	flags.SetOutput(a.errout)
+	replace := flags.Bool("replace", false, "back up and replace a different destination")
+	dryRun := flags.Bool("dry-run", false, "preview without writing")
+	positional, err := parseFlags(flags, args)
+	if err != nil {
+		return err
+	}
+	if len(positional) < 1 || len(positional) > 2 {
+		return errors.New("usage: agentctl adopt NAME [SOURCE] [--replace] [--dry-run]")
+	}
+	name := normalizeName(positional[0])
+	src := a.source(name)
+	if exists(src) {
+		return fmt.Errorf("%s is already in the store; use deploy %s", name, name)
+	}
+	source := ""
+	if len(positional) == 2 {
+		source = positional[1]
+	} else {
+		source, err = a.inferSource(name)
+		if err != nil {
+			return err
+		}
+	}
+	from, err := a.targetPath(source, name)
+	if err != nil {
+		return err
+	}
+	if !exists(from) {
+		return fmt.Errorf("live asset missing: %s", from)
+	}
+	if linked(from, src) || name == "instructions" && pointerTo(from, src) {
+		return errors.New("live asset already uses the store")
+	}
+	other := "codex"
+	if source == "codex" {
+		other = "claude-code"
+	}
+	to, err := a.targetPath(other, name)
+	if err != nil {
+		return err
+	}
+	if exists(to) && !(name == "instructions" && pointerTo(to, src)) {
+		equal, err := same(from, to)
+		if err != nil {
+			return err
+		}
+		if !equal && !*replace {
+			return fmt.Errorf("%s differs at %s; inspect with diff or use --replace", name, a.displayPath(to))
+		}
+	}
+	if *dryRun {
+		fmt.Fprintf(a.out, "would copy %s -> %s\n", a.displayPath(from), a.displayPath(src))
+		if other == "codex" && name != "instructions" && filepath.Clean(a.store) == filepath.Join(a.home, ".agents") && !exists(to) {
+			fmt.Fprintln(a.out, "codex: would use the store directly")
+		} else if name == "instructions" && pointerTo(to, src) {
+			fmt.Fprintln(a.out, "instructions: already points to the store")
+		} else {
+			if exists(to) {
+				fmt.Fprintf(a.out, "would backup %s under %s\n", a.displayPath(to), a.displayPath(filepath.Join(a.home, ".local/state/agentctl/backups")))
+			}
+			action := "link"
+			if name == "instructions" {
+				action = "pointer"
+			}
+			fmt.Fprintf(a.out, "would %s %s -> %s\n", action, a.displayPath(src), a.displayPath(to))
+		}
+		return nil
+	}
+	if err := a.pull([]string{name, source}); err != nil {
+		return err
+	}
+	deployArgs := []string{name, other}
+	if *replace {
+		deployArgs = append(deployArgs, "--replace")
+	}
+	return a.deploy(deployArgs)
+}
+
 // deployment records a preflighted local write or no-op.
-type deployment struct{ name, src, path, action, state, conflict string }
+type deployment struct{ target, name, src, path, action, state, conflict string }
 
 // deploy preflights every selected asset before previewing or applying writes.
 func (a app) deploy(args []string) error {
@@ -633,53 +841,64 @@ func (a app) deploy(args []string) error {
 	copyMode := flags.Bool("copy", false, "copy instead of link")
 	replace := flags.Bool("replace", false, "back up and replace a different live asset")
 	dryRun := flags.Bool("dry-run", false, "preview without writing")
+	targetFlag := flags.String("target", "", "limit deployment to one local target")
 	positional, err := parseFlags(flags, args)
 	if err != nil {
 		return err
 	}
-	if len(positional) < 1 || len(positional) > 2 {
-		return errors.New("usage: agentctl deploy TARGET [NAME] [--copy] [--replace] [--dry-run]")
-	}
-	if _, err := a.targetPath(positional[0], "instructions"); err != nil {
-		return err
+	if len(positional) > 2 || len(positional) == 2 && *targetFlag != "" {
+		return errors.New("usage: agentctl deploy [NAME [TARGET]] [--target=TARGET] [--copy] [--replace] [--dry-run]")
 	}
 	names := []string{}
-	if len(positional) == 2 {
-		names = append(names, normalizeName(positional[1]))
+	if len(positional) > 0 {
+		names = append(names, normalizeName(positional[0]))
 	} else {
 		names, err = a.assetNames()
 		if err != nil {
 			return err
 		}
 	}
-	plans, conflicts := []deployment{}, []error{}
-	for _, name := range names {
-		path, err := a.targetPath(positional[0], name)
-		if err != nil {
+	targets := []string{"codex", "claude-code"}
+	if len(positional) == 2 {
+		targets = positional[1:]
+	} else if *targetFlag != "" {
+		targets = []string{*targetFlag}
+	}
+	if len(targets) == 1 {
+		if _, err := a.targetPath(targets[0], "instructions"); err != nil {
 			return err
 		}
+	}
+	plans, conflicts := []deployment{}, []error{}
+	for _, name := range names {
 		src := a.source(name)
 		if !exists(src) {
 			return fmt.Errorf("canonical asset missing: %s", src)
 		}
-		state, err := a.state(positional[0], name)
-		if err != nil {
-			return err
+		for _, target := range targets {
+			path, err := a.targetPath(target, name)
+			if err != nil {
+				return err
+			}
+			state, err := a.state(target, name)
+			if err != nil {
+				return err
+			}
+			plan := deployment{target: target, name: name, src: src, path: path, action: "link", state: state}
+			switch {
+			case state == "direct" || state == "pointer" || state == "linked" && !*copyMode && name != "instructions" || state == "same copy" && *copyMode:
+				plan.action = "none"
+			case *copyMode:
+				plan.action = "copy"
+			case name == "instructions":
+				plan.action = "pointer"
+			}
+			if (state == "different" || state == "new") && !*replace {
+				plan.conflict = fmt.Sprintf("%s differs at %s; inspect with diff or use --replace", name, a.displayPath(path))
+				conflicts = append(conflicts, errors.New(plan.conflict))
+			}
+			plans = append(plans, plan)
 		}
-		plan := deployment{name: name, src: src, path: path, action: "link", state: state}
-		switch {
-		case state == "direct" || state == "pointer" || state == "linked" && !*copyMode && name != "instructions" || state == "same copy" && *copyMode:
-			plan.action = "none"
-		case *copyMode:
-			plan.action = "copy"
-		case name == "instructions":
-			plan.action = "pointer"
-		}
-		if (state == "different" || state == "new") && !*replace {
-			plan.conflict = fmt.Sprintf("%s differs at %s; inspect with diff or use --replace", name, a.displayPath(path))
-			conflicts = append(conflicts, errors.New(plan.conflict))
-		}
-		plans = append(plans, plan)
 	}
 	if *dryRun {
 		for _, plan := range plans {
@@ -688,7 +907,7 @@ func (a app) deploy(args []string) error {
 				continue
 			}
 			if plan.action != "copy" && plan.action != "link" && plan.action != "pointer" {
-				fmt.Fprintf(a.out, "%s: %s\n", plan.name, plan.state)
+				fmt.Fprintf(a.out, "%s/%s: %s\n", plan.target, plan.name, plan.state)
 				continue
 			}
 			if exists(plan.path) {
@@ -703,7 +922,7 @@ func (a app) deploy(args []string) error {
 	}
 	for _, plan := range plans {
 		if plan.action != "copy" && plan.action != "link" && plan.action != "pointer" {
-			fmt.Fprintf(a.out, "%s: %s\n", plan.name, plan.state)
+			fmt.Fprintf(a.out, "%s/%s: %s\n", plan.target, plan.name, plan.state)
 			continue
 		}
 		if exists(plan.path) {
@@ -737,18 +956,23 @@ func (a app) deploy(args []string) error {
 
 // export packages canonical text for manual account installation.
 func (a app) export(args []string) error {
-	if len(args) == 0 || len(args) > 2 {
-		return errors.New("usage: agentctl export claude-chat|chatgpt [NAME]")
+	flags := flag.NewFlagSet("export", flag.ContinueOnError)
+	flags.SetOutput(a.errout)
+	targetFlag := flags.String("target", "", "limit export to one account target")
+	positional, err := parseFlags(flags, args)
+	if err != nil {
+		return err
 	}
-	if args[0] != "claude-chat" && args[0] != "chatgpt" {
-		return fmt.Errorf("unknown account target %q", args[0])
+	if len(positional) > 2 || len(positional) == 2 && *targetFlag != "" {
+		return errors.New("usage: agentctl export [NAME [TARGET]] [--target=TARGET]")
 	}
 	names := []string{}
-	if len(args) == 2 {
-		if !validName(args[1]) {
-			return fmt.Errorf("invalid asset name %q", args[1])
+	if len(positional) > 0 {
+		name := normalizeName(positional[0])
+		if !validName(name) {
+			return fmt.Errorf("invalid asset name %q", name)
 		}
-		names = append(names, normalizeName(args[1]))
+		names = append(names, name)
 	} else {
 		var err error
 		names, err = a.assetNames()
@@ -756,25 +980,36 @@ func (a app) export(args []string) error {
 			return err
 		}
 	}
-	outDir := filepath.Join(a.home, ".local", "state", "agentctl", "exports", args[0])
-	if err := os.MkdirAll(outDir, 0755); err != nil {
-		return err
+	targets := []string{"claude-chat", "chatgpt"}
+	if len(positional) == 2 {
+		targets = positional[1:]
+	} else if *targetFlag != "" {
+		targets = []string{*targetFlag}
 	}
-	for _, name := range names {
-		src := a.source(name)
-		if !exists(src) {
-			return fmt.Errorf("canonical asset missing: %s", src)
-		}
-		dst := filepath.Join(outDir, name+".zip")
-		if name == "instructions" {
-			dst = filepath.Join(outDir, "instructions")
-			if err := replaceWithCopy(filepath.Join(a.store, "instructions"), dst); err != nil {
-				return err
-			}
-		} else if err := zipDir(src, dst); err != nil {
+	if len(targets) == 1 && targets[0] != "claude-chat" && targets[0] != "chatgpt" {
+		return fmt.Errorf("unknown account target %q", targets[0])
+	}
+	for _, target := range targets {
+		outDir := filepath.Join(a.home, ".local", "state", "agentctl", "exports", target)
+		if err := os.MkdirAll(outDir, 0755); err != nil {
 			return err
 		}
-		fmt.Fprintln(a.out, dst)
+		for _, name := range names {
+			src := a.source(name)
+			if !exists(src) {
+				return fmt.Errorf("canonical asset missing: %s", src)
+			}
+			dst := filepath.Join(outDir, name+".zip")
+			if name == "instructions" {
+				dst = filepath.Join(outDir, "instructions")
+				if err := replaceWithCopy(filepath.Join(a.store, "instructions"), dst); err != nil {
+					return err
+				}
+			} else if err := zipDir(src, dst); err != nil {
+				return err
+			}
+			fmt.Fprintln(a.out, dst)
+		}
 	}
 	fmt.Fprintln(a.out, "Install these files manually in the account. Instruction references may need adaptation. agentctl cannot inspect account versions or confirm drift.")
 	return nil
